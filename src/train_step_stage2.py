@@ -36,22 +36,26 @@ Array = jnp.ndarray
 def train_step_stage2(
     corr_state: TrainState,
     backbone_params: Dict,
-    backbone_apply_fn,
     encoder_params: Dict,
+    backbone_apply_fn,
     encoder_apply_fn,
     batch: Dict[str, Array],
     config,
 ) -> Tuple[TrainState, Dict[str, float]]:
     """Perform a single Stage 2 training step (correlation network only).
 
+    Arg order: positional JAX arrays first (corr_state, backbone_params, encoder_params),
+    then static callables/config (backbone_apply_fn, encoder_apply_fn, config) which are
+    baked in via functools.partial before pmap so they don't cross device boundaries.
+
     Args:
         corr_state:          TrainState for phi_eta (params + optimizer + EMA).
         backbone_params:     Frozen Stage 1 model params (use EMA params for stability).
-        backbone_apply_fn:   Backbone model's apply function (e.g. state.apply_fn).
         encoder_params:      Frozen T5 encoder params.
-        encoder_apply_fn:    T5 encoder apply function.
+        backbone_apply_fn:   Backbone model's apply function (baked in via partial).
+        encoder_apply_fn:    T5 encoder apply function (baked in via partial).
         batch:               Input batch dict from the dataloader.
-        config:              Config object with all hyperparameters.
+        config:              Config object with all hyperparameters (baked in via partial).
 
     Returns:
         Updated corr_state and a metrics dict with 'loss' and 'l2_loss'.
