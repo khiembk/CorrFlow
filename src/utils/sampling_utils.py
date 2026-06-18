@@ -394,3 +394,50 @@ def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
         z_gp = cond_seq_mask * x0 + (1 - cond_seq_mask) * z_gp
 
     return z_gp, v_gp, eps_gp
+
+
+# ============================================
+# Stage 2 — conditional velocity wrapper
+# ============================================
+
+def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_model, t_eps):
+    """Return a drop-in backbone apply_fn that adds the CorrNetwork velocity correction.
+
+    During ODE/SDE sampling the caller does:
+        net_out = model_apply_fn(params, z_input, t, ...)
+        v, x_pred = net_out_to_v_x(net_out, z, t)   →  v = (x_pred - z) / max(1-t, t_eps)
+
+    We replace x_pred with x_pred_modified so that net_out_to_v_x yields v_con:
+        v_ind  = (x_pred - z) / max(1-t, t_eps)
+        v_con  = v_ind + phi_eta(v_ind, t)
+        x_pred_modified = v_con * max(1-t, t_eps) + z
+
+    The decode step uses only decoder_logits (the second element of the tuple) and
+    ignores x_pred — so it is unaffected by this modification.
+
+    Self-conditioning: z_input may be [z, x_pred_prev] concatenated along the last
+    dim (shape B×L×2d). We always extract z = z_input[..., :d_model] which is safe
+    for both the conditioned (2d) and unconditioned (d) cases.
+    """
+    def wrapped_apply_fn(params, z_input, t, **kwargs):
+        net_out = backbone_apply_fn(params, z_input, t, **kwargs)
+
+        # net_out_to_v_x takes net_out[0] when it's a tuple.
+        x_pred = net_out[0] if isinstance(net_out, tuple) else net_out
+        decoder_logits = net_out[1] if isinstance(net_out, tuple) else None
+
+        # Extract z (first d_model dims — correct for both self-cond and no-self-cond)
+        z = z_input[..., :d_model]
+
+        # Compute v_ind, apply phi_eta, back-project to x_pred space
+        t_denom = jnp.maximum(1.0 - t[:, None, None], t_eps)
+        v_ind = (x_pred - z) / t_denom
+        delta_v = corr_apply_fn({"params": corr_params}, v_ind, t)
+        v_con = v_ind + delta_v
+        x_pred_modified = v_con * t_denom + z
+
+        if decoder_logits is None:
+            return x_pred_modified
+        return x_pred_modified, decoder_logits
+
+    return wrapped_apply_fn

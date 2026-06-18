@@ -56,6 +56,7 @@ from configs.config import (
 )
 from utils.data_utils import get_dataloader, prepare_batch, load_dataset, get_pad_token_id
 from train_step_stage2 import train_step_stage2
+from generation import run_generation
 
 
 logging.basicConfig(
@@ -470,6 +471,51 @@ def run_training(config):
         if config.save_freq >= 1 and current_epoch % config.save_freq == 0:
             save_checkpoint(corr_state, config.output_dir, global_step, hf_repo_id=config.hf_repo_id)
             log_for_0(f"Saved Stage 2 checkpoint at epoch {current_epoch} (step {global_step})")
+
+        # ---- Generation eval (v_con = v_ind + phi_eta; decode step unchanged) ----
+        do_eval = (
+            eval_dataset is not None
+            and config.sampling_configs
+            and config.eval_freq > 0
+            and current_epoch % config.eval_freq == 0
+        )
+        if do_eval:
+            log_for_0(f"Running Stage 2 generation eval (epoch {current_epoch})...")
+            corr_unreplicated = jax_utils.unreplicate(corr_state)
+
+            # Build a minimal state wrapping the frozen backbone so _setup_generation
+            # extracts backbone.apply and backbone EMA params for the ODE trajectory.
+            # corr EMA params are passed separately and applied via make_corr_model_apply_fn.
+            dummy_lr_fn = create_learning_rate_fn(
+                num_train_steps=1, num_warmup_steps=0, learning_rate=1e-3,
+            )
+            dummy_optimizer = get_optimizer(config, dummy_lr_fn)
+            rng, gen_rng, gen_dropout_rng = jax.random.split(rng, 3)
+            backbone_state_for_gen = TrainState.create(
+                apply_fn=backbone_model.apply,
+                params=jax_utils.unreplicate(frozen_backbone_params),
+                tx=dummy_optimizer,
+                dropout_rng=gen_dropout_rng,
+                ema_params1=jax_utils.unreplicate(frozen_backbone_params),
+            )
+            backbone_state_for_gen = backbone_state_for_gen.replace(
+                epoch=corr_unreplicated.epoch,
+                step=corr_unreplicated.step,
+            )
+            backbone_state_for_gen_rep = jax_utils.replicate(backbone_state_for_gen)
+
+            rng = run_generation(
+                state=backbone_state_for_gen_rep,
+                encoder_params=encoder_params,
+                encoder_apply_fn=encoder_model.apply,
+                eval_dataset=eval_dataset,
+                tokenizer=tokenizer,
+                config=config,
+                rng=gen_rng,
+                local_batch_size=local_batch_size,
+                corr_apply_fn=corr_model.apply,
+                corr_params=corr_unreplicated.ema_params1,
+            )
 
     log_for_0("\n" + "=" * 60)
     log_for_0("Stage 2 Training Complete")

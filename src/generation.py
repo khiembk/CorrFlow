@@ -26,6 +26,7 @@ from utils.generation_utils import (
     _setup_generation, _make_pmap_pair, _shard_timesteps, _shard_noise,
     _build_run_name,
 )
+from utils.sampling_utils import make_corr_model_apply_fn
 
 
 # ============================================
@@ -40,8 +41,15 @@ def run_generation(
     config,
     rng: PRNGKey,
     local_batch_size: int,
+    corr_apply_fn=None,
+    corr_params=None,
 ) -> PRNGKey:
-    """Run test generation."""
+    """Run test generation.
+
+    For Stage 2, pass corr_apply_fn=corr_model.apply and corr_params (unreplicated
+    EMA params) to compose v_con = v_ind + phi_eta during the ODE/SDE trajectory.
+    The decode step (argmax of decoder logits) is unchanged.
+    """
     for sc_idx, sc in enumerate(config.sampling_configs):
         if len(config.sampling_configs) > 1:
             log_for_0(f"\n--- Sampling config {sc_idx + 1}/{len(config.sampling_configs)} ---")
@@ -54,6 +62,8 @@ def run_generation(
             sampling_config=sc,
             batch_size=local_batch_size,
             num_samples=config.num_samples,
+            corr_apply_fn=corr_apply_fn,
+            corr_params=corr_params,
         )
         if eval_dataset is None:
             test_generation_uncond(**common_kwargs)
@@ -79,6 +89,8 @@ def test_generation_uncond(
     sampling_config: SamplingConfig,
     num_samples: int = 64,
     batch_size: int = 64,
+    corr_apply_fn=None,
+    corr_params=None,
 ):
     """Test unconditional generation (multi-device pmap)."""
     sampling_method = sampling_config.sampling_method
@@ -89,6 +101,15 @@ def test_generation_uncond(
      d_model, num_local_devices, effective_batch_size) = _setup_generation(
         state, config, batch_size, "              UNCONDITIONAL GENERATION EXAMPLES",
     )
+
+    if corr_apply_fn is not None and corr_params is not None:
+        model_apply_fn = make_corr_model_apply_fn(
+            backbone_apply_fn=model_apply_fn,
+            corr_apply_fn=corr_apply_fn,
+            corr_params=corr_params,
+            d_model=d_model,
+            t_eps=config.t_eps,
+        )
 
     pad_token_id = get_pad_token_id(tokenizer)
     eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 1
@@ -266,6 +287,8 @@ def test_generation_cond(
     dataset,
     num_samples: int = 64,
     batch_size: int = 64,
+    corr_apply_fn=None,
+    corr_params=None,
 ):
     """Test conditional generation (multi-device pmap)."""
     sampling_method = sampling_config.sampling_method
@@ -276,6 +299,15 @@ def test_generation_cond(
      d_model, num_local_devices, effective_batch_size) = _setup_generation(
         state, config, batch_size, "              CONDITIONAL GENERATION EXAMPLES",
     )
+
+    if corr_apply_fn is not None and corr_params is not None:
+        model_apply_fn = make_corr_model_apply_fn(
+            backbone_apply_fn=model_apply_fn,
+            corr_apply_fn=corr_apply_fn,
+            corr_params=corr_params,
+            d_model=d_model,
+            t_eps=config.t_eps,
+        )
 
     encode_latent_mean, encode_latent_std = config.latent_mean, config.latent_std
 
