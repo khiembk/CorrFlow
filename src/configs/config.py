@@ -60,6 +60,10 @@ class Config:
     t_eps: float = 5e-2
     time_schedule: str = "logit_normal"  # 'logit_normal' or 'uniform'
 
+    # GP path (Stage 2: correlation-aware path)
+    gp_q: int = 2          # Context window size: token i conditions on the previous gp_q tokens
+    gp_rho: float = 0.5    # Exponential kernel parameter: K(i,j) = gp_rho^|i-j|
+
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
     decoder_noise_scale: float = 1.0  # Scale of noise in logit-normal-noised latent for CE branch
