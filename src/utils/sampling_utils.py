@@ -259,76 +259,95 @@ def _sde_step(
 # GP Path (Stage 2: correlation-aware path)
 # ============================================
 
-def _gp_tables(gp_q: int, gp_rho: float):
-    """Precompute GP posterior weights for the exponential kernel K(i,j) = gp_rho^|i-j|.
+def _gp_tables(gp_q: int, gp_rho: float, gp_kernel: str = 'rbf'):
+    """Precompute GP posterior weights for context sizes 0..gp_q.
 
-    For each context size c in {0, ..., gp_q}, returns:
-      alpha[c]: shape (gp_q,) — right-aligned GP posterior weights.
-                alpha[c, gp_q-c:] holds the c actual weights (oldest→newest context);
-                alpha[c, :gp_q-c] = 0 (padding for smaller contexts at sequence start).
-      sigma[c]: scalar — GP posterior std for context size c.
+    Supports two kernels parameterised by gp_rho (= adjacent-token correlation):
+      'rbf':         K(i,j) = gp_rho^(|i-j|^2)  — non-Markov; q>1 adds new info.
+      'exponential': K(i,j) = gp_rho^|i-j|       — Markov; q>1 collapses to q=1.
 
-    Called once at trace time; results are embedded as JAX constants.
+    For each context size c returns:
+      alpha[c]: shape (gp_q,) — right-aligned GP posterior weights;
+                alpha[c, gp_q-c:] holds the c actual weights (oldest→newest),
+                alpha[c, :gp_q-c] = 0 (padding for shorter contexts at sequence start).
+      sigma[c]: scalar — GP posterior std.
+
+    Called once at trace time; results become JAX constants.
     """
+    if gp_kernel == 'rbf':
+        def K(d):
+            return gp_rho ** (int(d) ** 2)
+    elif gp_kernel == 'exponential':
+        def K(d):
+            return gp_rho ** abs(int(d))
+    else:
+        raise ValueError(f"Unknown gp_kernel '{gp_kernel}'. Choose 'rbf' or 'exponential'.")
+
     alpha = np.zeros((gp_q + 1, gp_q))
     sigma = np.zeros(gp_q + 1)
     sigma[0] = 1.0  # no context → prior: eps_gp = noise
 
     for c in range(1, gp_q + 1):
-        # Cross-covariance between current token and its c context tokens.
-        # k_cross[j] = K(current, context[j]) where context goes oldest→newest,
-        # i.e., distances c, c-1, ..., 1 from the current token.
-        k_cross = np.array([gp_rho ** (c - j) for j in range(c)])  # shape (c,)
+        # k_cross[j] = K(current, context[j]); context goes oldest→newest,
+        # distances c, c-1, ..., 1 from the current token.
+        k_cross = np.array([K(c - j) for j in range(c)])            # (c,)
 
-        # Kernel matrix of the c context tokens: K_ctx[a, b] = gp_rho^|a-b|
-        K_ctx = np.array([[gp_rho ** abs(a - b) for b in range(c)] for a in range(c)])
+        # Kernel matrix of the c context tokens.
+        K_ctx = np.array([[K(abs(a - b)) for b in range(c)] for a in range(c)])
         K_inv = np.linalg.inv(K_ctx + 1e-8 * np.eye(c))
 
-        alpha_c = k_cross @ K_inv                                    # (c,) GP weights
+        alpha_c = k_cross @ K_inv                                    # (c,)
         sigma[c] = np.sqrt(max(1.0 - float(k_cross @ K_inv @ k_cross), 0.0))
 
-        # Right-align into the full (gp_q,) vector so it aligns with the sliding buffer.
+        # Right-align into (gp_q,) so it lines up with the sliding buffer.
         alpha[c, gp_q - c:] = alpha_c
 
     return alpha, sigma
 
 
-def sample_gp_path(x0, noise, t, gp_q, gp_rho, noise_scale=1.0, cond_seq_mask=None):
+def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
+                   noise_scale=1.0, cond_seq_mask=None):
     """Construct the GP-correlated path and velocity target for Stage 2 training.
 
-    Each token's correlated noise eps_gp^i is sampled from the GP posterior conditioned
-    on the previous min(i, gp_q) tokens' already-correlated noise values:
+    Each token's correlated noise eps_gp^i is drawn from the GP posterior conditioned
+    on the previous min(i, gp_q) tokens' already-correlated noise:
 
         eps_gp^i = alpha^{c_i} · [eps_gp^{i-c_i}, ..., eps_gp^{i-1}]
                    + sigma^{c_i} · noise^i
 
     where c_i = min(i, gp_q) and (alpha^c, sigma^c) are the GP posterior parameters
-    for context size c under the exponential kernel K(i,j) = gp_rho^|i-j|.
+    for context size c under the chosen kernel (default: RBF).
 
-    The GP path and velocity then follow:
+    With RBF, K(i,j) = gp_rho^(|i-j|^2): adjacent-token correlation = gp_rho,
+    two-step = gp_rho^4, so farther tokens decorrelate faster than exponential.
+    This is non-Markov — context tokens beyond the immediate neighbour contribute
+    independent information, making gp_q > 1 meaningful.
+
+    The GP path and velocity:
         z_gp^i_t = t * x^i + (1-t) * eps_gp^i * noise_scale
         v_gp^i   = x^i - eps_gp^i * noise_scale
 
-    Token 0 (i=0, no context): eps_gp^0 = noise^0, i.e. the standard linear path.
+    Token 0 (no context): eps_gp^0 = noise^0 (standard linear path).
 
     Args:
-        x0:           (B, L, d) clean embeddings.
-        noise:        (B, L, d) i.i.d. N(0,I) used as GP innovation noise.
-        t:            (B,) timesteps in [0, 1].
-        gp_q:         Context window size (>= 1).
-        gp_rho:       Exponential kernel parameter; adjacent-token correlation.
-        noise_scale:  Global noise scale (matches denoiser_noise_scale in config).
-        cond_seq_mask: Optional (B, L, 1) mask — cond tokens are pinned to clean x0.
+        x0:            (B, L, d) clean embeddings.
+        noise:         (B, L, d) i.i.d. N(0,I) GP innovation noise.
+        t:             (B,) timesteps in [0, 1].
+        gp_q:          Context window size (>= 1).
+        gp_rho:        Adjacent-token correlation for the chosen kernel.
+        gp_kernel:     'rbf' (default) or 'exponential'.
+        noise_scale:   Global noise scale (matches denoiser_noise_scale in config).
+        cond_seq_mask: Optional (B, L, 1) mask — cond tokens pinned to clean x0.
 
     Returns:
         z_gp:   (B, L, d) GP-path latent at time t.
         v_gp:   (B, L, d) GP velocity target (= x0 - eps_gp * noise_scale).
-        eps_gp: (B, L, d) GP-correlated effective noise (useful for inspection/loss).
+        eps_gp: (B, L, d) GP-correlated effective noise.
     """
     B, L, d = x0.shape
 
     # Precompute GP tables in NumPy — runs at trace time, becomes JAX constants.
-    alpha_np, sigma_np = _gp_tables(gp_q, gp_rho)
+    alpha_np, sigma_np = _gp_tables(gp_q, gp_rho, gp_kernel)
     alpha_tbl = jnp.array(alpha_np, dtype=x0.dtype)   # (gp_q+1, gp_q)
     sigma_tbl = jnp.array(sigma_np, dtype=x0.dtype)   # (gp_q+1,)
 

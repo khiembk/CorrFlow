@@ -21,8 +21,9 @@ num_self_cond_cfg_tokens: 4
 num_model_mode_tokens: 4
 
 # GP path (used in Stage 2; defined here so Stage 2 config can inherit these values)
-gp_q: 2        # context window: token i conditions on the previous gp_q tokens
-gp_rho: 0.5   # exponential kernel: K(i,j) = gp_rho^|i-j|
+gp_q: 2           # context window: token i conditions on the previous gp_q tokens
+gp_rho: 0.5       # adjacent-token correlation
+gp_kernel: rbf    # rbf: K(i,j)=gp_rho^(|i-j|^2), non-Markov so gp_q>1 is meaningful
 
 # Denoiser objective (flow matching: L_ind = ||v_ind,θ(z_t, t) - v_lin||²)
 # Uses logit-normal time sampling and x-prediction (denoiser) parameterization.

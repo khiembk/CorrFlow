@@ -61,8 +61,9 @@ class Config:
     time_schedule: str = "logit_normal"  # 'logit_normal' or 'uniform'
 
     # GP path (Stage 2: correlation-aware path)
-    gp_q: int = 2          # Context window size: token i conditions on the previous gp_q tokens
-    gp_rho: float = 0.5    # Exponential kernel parameter: K(i,j) = gp_rho^|i-j|
+    gp_q: int = 2             # Context window size: token i conditions on the previous gp_q tokens
+    gp_rho: float = 0.5       # Adjacent-token correlation (shared meaning across kernels)
+    gp_kernel: str = 'rbf'    # Kernel: 'rbf' (non-Markov, gp_q>1 meaningful) or 'exponential' (Markov)
 
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
