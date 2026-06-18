@@ -1,0 +1,344 @@
+
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2026_conference,times}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+
+
+\title{Correlation Flow Matching for LLM}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{
+}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+The abstract paragraph should be indented 1/2~inch (3~picas) on both left and
+right-hand margins. Use 10~point type, with a vertical spacing of 11~points.
+The word \textsc{Abstract} must be centered, in small caps, and in point size 12. Two
+line spaces precede the abstract. The abstract must be limited to one
+paragraph.
+\end{abstract}
+
+\section{Introduction}
+Autoregressive language models remain the dominant paradigm for text generation. 
+Given a sequence $x=(x^1,\ldots,x^L)$, they factorize the joint distribution as
+\begin{equation}
+    p(x)=\prod_{l=1}^{L} p(x^l \mid x^{<l}),
+\end{equation}
+which provides a simple and effective way to model token dependencies. 
+Modern Transformer-based language models instantiate this factorization with causal self-attention, allowing each token prediction to depend on the previously generated context \citep{vaswani2017attention}. 
+However, the same left-to-right factorization also imposes a fundamental inference bottleneck: tokens must be generated sequentially, so the latency grows with the output length even when the model computation within each step is highly parallelized.
+
+Diffusion and flow-based language models offer an appealing alternative by generating or refining multiple tokens in parallel. 
+Recent work has explored both continuous-space and discrete-space formulations, including diffusion over word embeddings, simplex-based diffusion, masked diffusion models, discrete flow matching, and embedding-space flow matching \citep{li2022diffusionlm,han2023ssdlm,gulrajani2023likelihood,gat2024discreteflow,nie2025large,ye2025dream,hu2026elf}. 
+Flow Matching is especially attractive because it trains a continuous-time velocity field with a simulation-free regression objective and can use different probability paths between a source distribution and the data distribution \citep{lipman2023flowmatching}. 
+In language modeling, this suggests a route toward faster generation: instead of sampling tokens one by one, a model may transport a noisy sequence or embedding sequence toward the data distribution through a small number of parallel denoising or flow steps.
+
+Despite this promise, parallel generative language models still lag behind strong autoregressive models in important quality--efficiency regimes. 
+A common simplification in non-autoregressive diffusion or flow formulations is that the generation path, decoder, or training target is factorized over token positions conditioned on a shared noisy state or latent variable. 
+Although the neural network may use contextual attention, the probability path itself often does not explicitly encode the sequential correlations that autoregressive models capture through the chain rule. 
+This mismatch is important: recent theoretical and empirical analyses show that masked diffusion language models can be efficient under token-level or perplexity-based metrics, but may require many sampling steps for sequence-level correctness, reducing their practical advantage on accuracy-sensitive tasks \citep{feng2025theoretical}. 
+This suggests that the gap between autoregressive and flow-based language models is not only a matter of sampling speed, but also of how token dependencies are represented during the transport process.
+
+In this paper, we propose \emph{Semi-Autoregressive Flow Matching} for language modeling, a correlation-aware flow framework that aims to preserve the parallelism of flow-based generation while injecting autoregressive-style dependency structure into the learned dynamics. 
+Our key idea is to model token correlation at two complementary levels. 
+First, we introduce a \emph{correlation-aware probability path}: instead of transporting each token independently with a linear interpolation path, we define the path of token $x^l$ conditionally on a local context of previous tokens $x^{l-q:l-1}$. 
+Motivated by Gaussian-process-based flow matching for correlated data \citep{wei2025streamlevel,kollovieh2025tsflow}, this path provides a stochastic mechanism for coupling nearby token trajectories while retaining a tractable flow-matching objective. 
+Second, we introduce a \emph{correlation-aware velocity field} that decomposes the velocity for each token into an independent component and a dependency correction:
+\begin{equation}
+    v^l_{\mathrm{con}}(x,t)
+    =
+    v^l_{\mathrm{ind},\theta}(x,t)
+    +
+    \phi^l\!\left(v^{<l},t\right),
+\end{equation}
+where $\phi$ is a lightweight correlation network. 
+During training, the correction is supervised to match the velocity induced by the correlation-aware path; during inference, it is computed from the model-predicted velocities, allowing tokens to be updated in parallel or block-parallel form rather than strictly left-to-right.
+
+Our formulation bridges two desirable properties that are usually separated: autoregressive models explicitly represent token dependencies but generate sequentially, while flow-based models generate in parallel but often rely on weaker dependency structure in their probability paths. 
+By making the transport path and velocity field correlation-aware, our method seeks to reduce this trade-off and provide a more direct mechanism for modeling sequence-level consistency in flow-based language generation.
+
+\paragraph{Contributions.}
+We summarize our contributions as follows:
+\begin{itemize}
+    \item We identify the lack of explicit token-correlated transport as a key limitation of parallel flow-based language modeling.
+    \item We propose a correlation-aware probability path that conditions each token trajectory on a finite context window, enabling semi-autoregressive dependency modeling within Flow Matching.
+    \item We introduce a correlation-aware velocity decomposition that adds a learned dependency correction to an independent token velocity while preserving parallel or block-parallel inference.
+    \item We provide an experimental protocol for comparing independent embedding flows, discrete/simplex flow baselines, and autoregressive models under both generation quality and sampling-efficiency metrics.
+\end{itemize}
+
+\section{Related works}
+\section{Method}
+\label{sec:method}
+In this section, we first provide the problem setting (Sec~\ref{sec:problem_statement}). We then introduce two components that model the correlation among token in a single language sample: correlation path (Sec~\ref{sec:corr_path}) and correlation flow (Sec~\ref{sec:corr_flow}). 
+
+\subsection{Problem statement}
+\label{sec:problem_statement}
+Given a sentence, we tokenize it into a sequence of tokens $\mathbf{s} = [s_1, ..., s_{L}] \in V^{L},$ where each $s_i$ is drawn from the vocabulary $V$ and $L$ denotes the sequence length. We then map the discrete token sequence into a continuous
+embedding space. The choice of the embedding method is flexible. By default, we use a pretrained T5 encoder~\citep{raffel2023exploringlimitstransferlearning} (denoted as $\text{encode}$) for bidirectional contextual embeddings. We have the embedding latent $\mathbf{x} = [x_1, ..., x_L] =\text{encode}(\mathbf{s}) \in \mathbb{R}^{d\times L}$.
+
+\subsection{Correlation-aware path}
+\label{sec:corr_path}
+Flow Matching defines a continuous flow path from noise to data in embedding space. Let $\mathbf{x} \sim p_{\text{data}}(\mathbf{x})$ denote the embedding distribution and $\mathbf{\epsilon} \sim \mathcal{N}(0, I)$ denote the noise distribution. We define the time-dependent noisy latent variable $\mathbf{z}_t = [\mathbf{z}^{1}_t, ..., \mathbf{z}^{L}_t] \in \mathbb{R}^{d \times L }$ where $t \in [0,1]$ and $\mathbf{z}_0 \sim \mathcal{N}(0, I)$ and $\mathbf{z}_1 \sim p_{\text{data}}$. Following the autoregressive formulation, each token in a language sample depends on the previous tokens. We model these dependencies using Gaussian Processes (GP) such that $\mathbf{z}^{i}_{t} = \mathbf{f}(t, \mathbf{z}^{j<i}) \sim \mathcal{N}$. The first token $\mathbf{z}^1_t$ is defined by linear interpolation
+\begin{equation}
+    \mathbf{z}^{1}_t = (1-t) \epsilon^1 + t x^1
+\end{equation}
+For computational efficiency, we use the context window $q$ such that each token approximately depends on $q$ previous tokens $\mathbf{z}^{i}_{t} = \mathbf{f}(t, \mathbf{z}^{i-q<j<i}) \sim \mathcal{N}$. After defining the generation path, we can compute the velocity field on the conditional path (GP) by taking the derivative with respect to time. We denote the velocity that is computed from the linear interpolation path as $v^{\text{lin}}$ and the GP path as $v^{\text{gp}}$.
+
+\subsection{Correlation-aware flow}
+\label{sec:corr_flow}
+In this section, we introduce \emph{Correlation-aware Flow}, which models the dependency structure among token-level velocity fields. 
+A standard flow-matching model learns a velocity field that transports the noisy latent variable $\mathbf{z}_t$ toward the data embedding $\mathbf{x}$ \citep{lipman2023flowmatching}. 
+However, if each token velocity is trained only with an independent linear interpolation target, the transport process may ignore the sequential correlation among tokens. 
+This is undesirable for language modeling, where the semantic validity of a token often depends on its previous context.
+
+From the correlation-aware path in Section~\ref{sec:corr_path}, we have two types of token-level velocity targets. 
+The first one is the velocity induced by the linear interpolation path, denoted by $v_{\text{lin}}^{i}$. 
+The second one is the velocity induced by the GP-based conditional path, denoted by $v_{\text{gp}}^{i}$. 
+The linear velocity provides a simple independent transport target, while the GP velocity contains additional dependency information from previous tokens.
+
+We first define an independent velocity model $v_{\text{ind},\theta}^{i}$ that predicts the velocity of token $i$ from the current latent state $\mathbf{z}_t$ and time $t$. 
+This model is trained with the standard flow-matching objective:
+\begin{equation}
+    \mathcal{L}_{\text{ind}}
+    =
+    \mathbb{E}_{\mathbf{x},\epsilon,t}
+    \left[
+        \sum_{i=1}^{L}
+        \left\|
+            v_{\text{ind},\theta}^{i}(\mathbf{z}_t,t)
+            -
+            v_{\text{lin}}^{i}
+        \right\|_2^2
+    \right].
+\end{equation}
+This independent velocity serves as the base transport field. 
+However, it does not explicitly force the velocity of token $i$ to depend on the transport behavior of previous tokens.  Motivated by prior practice~\cite{li2026basicsletdenoisinggenerative}, we define the denoiser $D^i_{\theta}(\mathbf{z}_t, t) = \mathbb{E}[x^i \mid \mathbf{z}_t, t]$ that we can parameterize the velocity feild as 
+\begin{equation}
+    v^i_{\text{ind}, \theta}(\mathbf{z}_t, t) = \frac{D^i_{\theta}(\mathbf{z}_t, t) - \mathbf{z}_t}{1-t}
+\end{equation}
+
+To inject token dependency into the velocity field, we introduce a correlation network $\phi_\eta$. 
+Let
+\begin{equation}
+    \mathcal{C}_i = \{j \mid \max(1,i-q) \leq j < i\}
+\end{equation}
+be the local causal context window of token $i$. 
+The conditional velocity of token $i$ is defined as
+\begin{equation}
+    v_{\text{con},\theta,\eta}^{i}(\mathbf{z}_t,t)
+    =
+    v_{\text{ind},\theta}^{i}(\mathbf{z}_t,t)
+    +
+    \phi_\eta^{i}
+    \left(
+        \{\mathrm{sg}
+        \left[
+            v^j_{\mathrm{ind},\theta}(\mathbf{z}^{\mathrm{gp}}_t,t)
+        \right]\}_{j \in \mathcal{C}_i}, t
+    \right).
+    \label{eq:training_cond_velocity}
+\end{equation}
+Here, $\phi_\eta^{i}$ predicts a dependency correction from the velocities of previous tokens. 
+During training, we use the ground-truth linear velocities $\{v_{\text{lin}}^{j}\}_{j \in \mathcal{C}_i}$ as the input to $\phi_\eta$. 
+This gives the correlation network a clean supervision signal for learning how previous token transitions influence the transition of token $i$.
+
+The conditional velocity is trained to match the GP-based velocity target:
+\begin{equation}
+    \mathcal{L}_{\text{con}}
+    =
+    \mathbb{E}_{\mathbf{x},\epsilon,t}
+    \left[
+        \sum_{i=1}^{L}
+        \left\|
+            v_{\text{con},\theta,\eta}^{i}(\mathbf{z}_t,t)
+            -
+            v_{\text{gp}}^{i}
+        \right\|_2^2
+    \right].
+    \label{eq:conditional_velocity_loss}
+\end{equation}
+
+At inference time, the ground-truth linear velocities $v_{\text{lin}}$ are not available. 
+Therefore, we replace them with the predicted independent velocities. 
+First, we compute all independent token velocities in parallel:
+\begin{equation}
+    \hat{\mathbf{v}}_{\text{ind},\theta}
+    =
+    v_{\text{ind},\theta}(\mathbf{z}_t,t).
+\end{equation}
+Then, the inference-time conditional velocity is given by
+\begin{equation}
+    v_{\text{con},\theta,\eta}^{i}(\mathbf{z}_t,t)
+    =
+    v_{\text{ind},\theta}^{i}(\mathbf{z}_t,t)
+    +
+    \phi_\eta^{i}
+    \left(
+        \{
+        v_{\text{ind},\theta}^{j}(\mathbf{z}_t,t)
+        \}_{j \in \mathcal{C}_i}, t
+    \right).
+    \label{eq:inference_cond_velocity}
+\end{equation}
+This design mimics the autoregressive dependency structure because the correction for token $i$ depends only on previous token velocities. 
+At the same time, it preserves parallel generation: all independent velocities are predicted in one forward pass, and the correlation network can be implemented as a causal convolution or causal self-attention module that outputs corrections for all token positions simultaneously \citep{vaswani2017attention}. 
+The resulting ODE is
+\begin{equation}
+    \frac{d\mathbf{z}_t}{dt}
+    =
+    v_{\text{con},\theta,\eta}(\mathbf{z}_t,t),
+\end{equation}
+which transports the entire sequence jointly from noise to the embedding distribution.
+
+\subsection{Training and inference algorithms}
+\label{sec:algorithm}
+
+We train the proposed model in two stages. 
+In the first stage, we train the independent velocity field $v_{\mathrm{ind},\theta}$ using the standard linear flow-matching target. 
+In the second stage, we freeze $v_{\mathrm{ind},\theta}$ and train only the correlation network $\phi_\eta$ to predict a dependency correction such that the resulting conditional velocity matches the GP-based target $v_{\mathrm{gp}}$. 
+This two-stage procedure stabilizes training because the correlation network only needs to learn the residual dependency structure on top of an already learned base transport field.
+
+\begin{algorithm}[t]
+\caption{Two-stage training of Correlation-aware Flow}
+\label{alg:training}
+\begin{algorithmic}[1]
+\Require Dataset $\mathcal{D}$, encoder $\mathrm{encode}$, context window $q$, independent velocity field $v_{\mathrm{ind},\theta}$, correlation network $\phi_\eta$, learning rates $\alpha_\theta,\alpha_\eta$
+\Ensure Trained parameters $\theta,\eta$
+
+\Statex \textbf{Stage 1: Train independent velocity field}
+\For{$n = 1,\ldots,N_1$}
+    \State $\mathbf{s} \sim \mathcal{D} $, Compute  $\mathbf{x} = \mathrm{encode}(\mathbf{s})$
+    \State Sample $\epsilon \sim \mathcal{N}(0,I)$ ,$t \sim \mathcal{U}(0,1)$, $\mathbf{z}_t = \mathbf{x} t + (1-t) \epsilon$
+    \State Compute independent flow-matching loss:
+    \[
+        \mathcal{L}_{\mathrm{ind}}
+        =
+        \sum_{i=1}^{L}
+        \left\|
+            \widehat{v}^{i}_{\mathrm{ind}, \theta}
+            -
+            v^{i}_{\mathrm{lin}}
+        \right\|_2^2
+    \]
+    \State Update $\theta \leftarrow \theta - \alpha_\theta \nabla_\theta \mathcal{L}_{\mathrm{ind}}$
+\EndFor
+
+\Statex \textbf{Stage 2: Train correlation network}
+\State Freeze $\theta$
+\For{$n = 1,\ldots,N_2$}
+    \State $\mathbf{s} \sim \mathcal{D}$, Compute $\mathbf{x} = \mathrm{encode}(\mathbf{s})$
+    \State Sample $\epsilon \sim \mathcal{N}(0,I)$ and $t \sim \mathcal{U}(0,1)$
+    \State Construct the  GP path $\mathbf{z}^{\mathrm{gp}}_t$  and $\mathbf{v}_{\mathrm{gp}}$ 
+    \State Predict frozen independent velocity:
+    \[
+        \widehat{\mathbf{v}}_{\mathrm{ind}}
+        =
+        \mathrm{sg}
+        \left[
+            v_{\mathrm{ind},\theta}(\mathbf{z}^{\mathrm{gp}}_t,t)
+        \right]
+    \]
+    \State  Compute $\widehat{v}^{i}_{\mathrm{con}}=\widehat{v}^{i}_{\mathrm{ind}}+\phi^i_\eta\left(\{\mathrm{sg}
+        \left[
+            v^j_{\mathrm{ind},\theta}(\mathbf{z}^{\mathrm{gp}}_t,t)
+        \right]\}_{j\in\mathcal{C}_i},t\right)$.
+    \State Compute conditional flow-matching loss:
+    \[
+        \mathcal{L}_{\mathrm{con}}
+        =
+        \sum_{i=1}^{L}
+        \left\|
+            \widehat{v}^{i}_{\mathrm{con}}
+            -
+            v^{i}_{\mathrm{gp}}
+        \right\|_2^2
+    \]
+    \State Update $\eta \leftarrow \eta - \alpha_\eta \nabla_\eta \mathcal{L}_{\mathrm{con}}$
+\EndFor
+\State \Return $\theta,\eta$
+\end{algorithmic}
+\end{algorithm}
+
+
+
+\begin{algorithm}[t]
+\caption{Inference with Correlation-aware Flow}
+\label{alg:inference}
+\begin{algorithmic}[1]
+\Require Trained independent velocity field $v_{\mathrm{ind},\theta}$, trained correlation network $\phi_\eta$, sequence length $L$, context window $q$, number of solver steps $K$, decoder $\mathrm{decode}$
+\Ensure Generated token sequence $\widehat{\mathbf{s}}$
+
+\State Sample initial noise $\mathbf{z}_0 \sim \mathcal{N}(0,I)$
+\State Set step size $\Delta t = 1/K$
+\For{$k = 0,\ldots,K-1$}
+    \State Set $t_k = k/K$
+    \State Predict all independent velocities in parallel:
+    \[
+        \widehat{\mathbf{v}}_{\mathrm{ind}}
+        =
+        v_{\mathrm{ind},\theta}(\mathbf{z}_{t_k},t_k)
+    \]
+    \State Compute conditional velocity:
+        \[
+            \widehat{v}^{i}_{\mathrm{con}}
+            =
+            \widehat{v}^{i}_{\mathrm{ind}}
+            +
+            \Delta v^i_\eta
+        \]
+    \State Update the latent variable using an ODE solver:
+    \[
+        \mathbf{z}_{t_{k+1}}
+        =
+        \mathbf{z}_{t_k}
+        +
+        \Delta t \,
+        \widehat{\mathbf{v}}_{\mathrm{con}}
+    \]
+\EndFor
+\State Decode the final embedding:
+\[
+    \widehat{\mathbf{s}}
+    =
+    \mathrm{decode}(\mathbf{z}_1)
+\]
+\State \Return $\widehat{\mathbf{s}}$
+\end{algorithmic}
+\end{algorithm}
+
+\newpage
+\bibliography{iclr2026_conference}
+\bibliographystyle{iclr2026_conference}
+
+\appendix
+\section{Appendix}
+
+
+
+\end{document}
