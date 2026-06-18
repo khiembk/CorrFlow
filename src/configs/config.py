@@ -67,6 +67,7 @@ class Config:
 
     # CorrNetwork φ_η (Stage 2: correlation network)
     corr_model: str = 'CorrNet-M'  # Size variant: CorrNet-S (h=128), CorrNet-M (h=256), CorrNet-L (h=512)
+    backbone_checkpoint: str = None  # Path to frozen Stage 1 checkpoint (Stage 2 only)
 
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step

@@ -1,0 +1,86 @@
+# Stage 2: Train the correlation network φ_η with the Stage 1 backbone frozen.
+# Ref: "Correlation Flow Matching for LLM" (CorrFlow, ICLR 2026)
+#
+# The backbone (theta) is loaded from backbone_checkpoint and held frozen.
+# Only phi_eta (CorrNetwork) is trained to match the GP-path velocity target:
+#
+#   v_con^i = v_ind^i + phi_eta(sg[v_ind], t)
+#   L_con   = E[ mean_i ||v_con^i - v_gp^i||^2 ]
+#
+# Run:
+#   cd src
+#   python train_stage2.py --config configs/training_configs/train_corrflow_stage2_owt.yml
+
+# Dataset (same as Stage 1)
+data_path: "embedded-language-flows/openwebtext-t5"
+max_length: 1024
+
+# Encoder (same as Stage 1 — frozen)
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Backbone architecture — must match the Stage 1 checkpoint exactly
+model: ELF-B
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Frozen Stage 1 checkpoint (EMA params are loaded and frozen)
+backbone_checkpoint: "outputs/corrflow_stage1-owt"
+
+# GP path — must match Stage 1 values so the velocity targets are consistent
+gp_q: 2           # context window size (token i conditions on previous gp_q tokens)
+gp_rho: 0.5       # adjacent-token correlation for the RBF kernel
+gp_kernel: rbf    # K(i,j) = gp_rho^(|i-j|^2); non-Markov, gp_q > 1 is meaningful
+
+# CorrNetwork φ_η architecture
+corr_model: CorrNet-M   # CorrNet-S (h=128,L=2), CorrNet-M (h=256,L=2), CorrNet-L (h=512,L=4)
+
+# Denoiser time schedule (Stage 2 uses same sampling as Stage 1 for z_gp)
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Backbone self-conditioning settings (must match Stage 1 — used to configure the
+# zero self-cond input passed to the frozen backbone during Stage 2 forward passes)
+self_cond_prob: 0.5
+
+# Training
+epochs: 3
+global_batch_size: 512
+blr: 0.001          # same base LR as Stage 1; CorrNet zero-init means safe to keep high
+weight_decay: 0.0
+warmup_epochs: 0.1
+warmup_steps: -1
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling (evaluation uses the full composed model v_con = v_ind + delta_v)
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+num_samples: 1000
+
+# Logging & Checkpointing
+log_freq: 100
+save_freq: 1
+eval_freq: 1
+
+# Output
+output_dir: "outputs/corrflow_stage2-owt"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: true
+wandb_project: corrflow
+wandb_entity: null
+wandb_run_name: corrflow_stage2-owt
+
+# Misc
+seed: 42
