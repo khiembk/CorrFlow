@@ -1,0 +1,88 @@
+# Stage 2: Train the correlation network φ_η on WMT14 De-En.
+# Uses the official pre-trained ELF-B-de-en checkpoint as the frozen backbone,
+# skipping Stage 1 entirely.
+#
+# Pre-trained backbone: embedded-language-flows/ELF-B-de-en (orbax ocdbt format)
+# Downloaded to: /scratch/user/u.kt348068/checkpoints/ELF-B-de-en
+#
+# Run:
+#   cd src
+#   python train_stage2.py --config configs/training_configs/train_corrflow_stage2_wmt14.yml
+
+# Dataset (local, pre-encoded; downloaded from embedded-language-flows HF org)
+data_path: "/scratch/user/u.kt348068/data/wmt14_de-en_train_t5"
+eval_data_path: "/scratch/user/u.kt348068/data/wmt14_de-en_validation_t5"
+max_length: 128         # 64 source + 64 target
+max_input_length: 64    # source (German) length
+pad_token: eos
+
+# Encoder (frozen T5-small)
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Backbone architecture — must match the checkpoint exactly (ELF-B)
+model: ELF-B
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Frozen backbone: official ELF-B-de-en pre-trained checkpoint (orbax ocdbt format).
+# train_stage2.py detects the format automatically and loads via orbax.
+backbone_checkpoint: "/scratch/user/u.kt348068/checkpoints/ELF-B-de-en"
+
+# GP path — tune gp_rho / gp_q to control inter-token correlation
+gp_q: 2
+gp_rho: 0.5
+gp_kernel: rbf
+
+# CorrNetwork φ_η architecture
+corr_model: CorrNet-M   # CorrNet-S (h=128,L=2) for faster first check
+
+# Denoiser time schedule (must match Stage 1 / backbone training settings)
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Backbone self-conditioning (must match ELF-B-de-en training settings)
+self_cond_prob: 0.5
+label_drop_prob: 0.1
+
+# Training
+epochs: 3
+global_batch_size: 512
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 500
+warmup_epochs: -1
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/cond_sampling_configs.yml"
+num_samples: 1000
+
+# Logging & Checkpointing
+log_freq: 100
+save_freq: 1
+eval_freq: 1
+
+# Output
+output_dir: "outputs/corrflow_stage2-wmt14"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: true
+wandb_project: corrflow
+wandb_entity: null
+wandb_run_name: corrflow_stage2-wmt14
+
+# Misc
+seed: 42

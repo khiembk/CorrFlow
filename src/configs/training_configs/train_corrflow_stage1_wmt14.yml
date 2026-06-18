@@ -1,0 +1,89 @@
+# Stage 1: Train the independent velocity field v_ind,θ on WMT14 De-En (conditional).
+# Follows the ELF training recipe (arXiv:2605.10938).
+# NOTE: The official ELF-B-de-en checkpoint on HuggingFace can replace this Stage 1 run
+# entirely — use train_corrflow_stage2_wmt14.yml with backbone_checkpoint pointing to
+# the pre-trained checkpoint to skip straight to Stage 2.
+#
+# Run:
+#   cd src
+#   python train.py --config configs/training_configs/train_corrflow_stage1_wmt14.yml
+
+# Dataset (local, pre-encoded with T5; downloaded from embedded-language-flows HF org)
+data_path: "/scratch/user/u.kt348068/data/wmt14_de-en_train_t5"
+eval_data_path: "/scratch/user/u.kt348068/data/wmt14_de-en_validation_t5"
+max_length: 128         # total sequence length: 64 source + 64 target tokens
+max_input_length: 64    # source (German) length; remainder is target (English)
+pad_token: eos          # WMT14 uses EOS as padding (no dedicated pad token)
+
+# Encoder (frozen T5-small, same as ELF paper)
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture (ELF-B, same as ELF paper default)
+model: ELF-B
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# GP path (Stage 2 settings; define here so Stage 2 config can inherit)
+gp_q: 2
+gp_rho: 0.5
+gp_kernel: rbf
+
+# CorrNetwork (Stage 2 only)
+corr_model: CorrNet-M
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 5.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+label_drop_prob: 0.1     # 10% unconditional for CFG training
+self_cond_prob: 0.5
+
+# Training
+epochs: 100
+global_batch_size: 512
+blr: 0.001               # effective lr = blr * (512/256) = 0.002, matching ELF paper
+weight_decay: 0.0
+warmup_steps: 5000
+warmup_epochs: -1        # warmup_steps takes precedence when >= 0
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/cond_sampling_configs.yml"
+num_samples: 1000
+
+# Logging & Checkpointing
+log_freq: 100
+save_freq: 10
+eval_freq: 10
+
+# Output
+output_dir: "outputs/corrflow_stage1-wmt14"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: true
+wandb_project: corrflow
+wandb_entity: null
+wandb_run_name: corrflow_stage1-wmt14
+
+# Misc
+seed: 42

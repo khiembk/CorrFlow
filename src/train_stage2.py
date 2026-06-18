@@ -83,17 +83,49 @@ def parse_args():
 # Frozen backbone loader
 # ============================================
 
+def _load_ema_params_orbax(checkpoint_dir: str):
+    """Load ema_params1 from an orbax ocdbt checkpoint (e.g. HuggingFace ELF checkpoints).
+
+    These checkpoints store arrays in ocdbt shards under a checkpoint_N/ subdirectory.
+    We restore the raw pytree (target=None) and extract ema_params1.
+    """
+    import orbax.checkpoint as ocp
+
+    ckpt_dir = os.path.abspath(os.path.expanduser(checkpoint_dir))
+    # Find the latest checkpoint_N subdirectory.
+    subdirs = sorted(
+        [d for d in os.listdir(ckpt_dir) if d.startswith("checkpoint_")],
+        key=lambda x: int(x.split("_")[1]),
+    )
+    if not subdirs:
+        raise FileNotFoundError(f"No checkpoint_N directory found in {ckpt_dir}")
+    ckpt_path = os.path.join(ckpt_dir, subdirs[-1])
+    log_for_0(f"Loading orbax ocdbt checkpoint from {ckpt_path}...")
+
+    checkpointer = ocp.PyTreeCheckpointer()
+    restored = checkpointer.restore(ckpt_path)   # returns raw nested dict
+    if "ema_params1" not in restored:
+        raise ValueError(f"'ema_params1' not found in orbax checkpoint at {ckpt_path}")
+    log_for_0("Loaded frozen backbone EMA params (orbax ocdbt format).")
+    return jax.tree_util.tree_map(jnp.array, restored["ema_params1"])
+
+
 def load_frozen_backbone(config, backbone_model, rng, d_model):
     """Initialise the backbone model, restore Stage 1 EMA weights, return frozen params.
 
-    We build a full TrainState with the same optimizer type as Stage 1 so that the
-    checkpoint's opt_state bytes can be decoded against a compatible template.
-    The loaded EMA params (ema_params1) are returned; the optimizer state is discarded.
+    Supports two checkpoint formats automatically:
+      1. Msgpack format written by our save_checkpoint (Stage 1 runs).
+         Uses a full TrainState template so opt_state shapes match for deserialization.
+      2. Orbax ocdbt format used by the official HuggingFace ELF checkpoints
+         (e.g. embedded-language-flows/ELF-B-de-en).
+         Detected when our msgpack load fails; requires orbax-checkpoint installed.
+
+    Returns the ema_params1 pytree (frozen backbone weights).
     """
     if not config.backbone_checkpoint:
         raise ValueError(
             "backbone_checkpoint must be set in the Stage 2 config "
-            "(path to the Stage 1 output directory)."
+            "(path to the Stage 1 output directory or HF checkpoint)."
         )
 
     log_for_0(f"Initialising backbone ({config.model}) for checkpoint loading...")
@@ -110,6 +142,7 @@ def load_frozen_backbone(config, backbone_model, rng, d_model):
     total_backbone_params = sum(x.size for x in jax.tree_util.tree_leaves(init_params))
     log_for_0(f"Backbone parameters: {total_backbone_params:,}")
 
+    # --- Format 1: msgpack (our save_checkpoint format) ---
     # Build a TrainState with a dummy Muon optimizer so the opt_state structure
     # matches the Stage 1 checkpoint exactly (needed for deserialization).
     dummy_lr_fn = create_learning_rate_fn(
@@ -124,10 +157,16 @@ def load_frozen_backbone(config, backbone_model, rng, d_model):
         ema_params1=init_params["params"],
     )
 
-    log_for_0(f"Loading Stage 1 checkpoint from {config.backbone_checkpoint}...")
-    backbone_state, ckpt_step = load_checkpoint(config.backbone_checkpoint, backbone_state)
-    log_for_0(f"Loaded backbone EMA params from Stage 1 step {ckpt_step}.")
-    return backbone_state.ema_params1
+    log_for_0(f"Loading backbone checkpoint from {config.backbone_checkpoint}...")
+    try:
+        backbone_state, ckpt_step = load_checkpoint(config.backbone_checkpoint, backbone_state)
+        log_for_0(f"Loaded frozen backbone EMA params (msgpack format, step {ckpt_step}).")
+        return backbone_state.ema_params1
+    except Exception as e:
+        log_for_0(f"Msgpack load failed ({e}); trying orbax ocdbt format...")
+
+    # --- Format 2: orbax ocdbt (HuggingFace ELF checkpoints) ---
+    return _load_ema_params_orbax(config.backbone_checkpoint)
 
 
 # ============================================
