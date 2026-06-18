@@ -65,6 +65,9 @@ class Config:
     gp_rho: float = 0.5       # Adjacent-token correlation (shared meaning across kernels)
     gp_kernel: str = 'rbf'    # Kernel: 'rbf' (non-Markov, gp_q>1 meaningful) or 'exponential' (Markov)
 
+    # CorrNetwork φ_η (Stage 2: correlation network)
+    corr_model: str = 'CorrNet-M'  # Size variant: CorrNet-S (h=128), CorrNet-M (h=256), CorrNet-L (h=512)
+
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
     decoder_noise_scale: float = 1.0  # Scale of noise in logit-normal-noised latent for CE branch

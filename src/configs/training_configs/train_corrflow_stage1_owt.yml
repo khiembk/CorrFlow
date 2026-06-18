@@ -25,6 +25,9 @@ gp_q: 2           # context window: token i conditions on the previous gp_q toke
 gp_rho: 0.5       # adjacent-token correlation
 gp_kernel: rbf    # rbf: K(i,j)=gp_rho^(|i-j|^2), non-Markov so gp_q>1 is meaningful
 
+# CorrNetwork φ_η (Stage 2 only; defined here for reference / override)
+corr_model: CorrNet-M   # CorrNet-S (h=128,L=2), CorrNet-M (h=256,L=2), CorrNet-L (h=512,L=4)
+
 # Denoiser objective (flow matching: L_ind = ||v_ind,θ(z_t, t) - v_lin||²)
 # Uses logit-normal time sampling and x-prediction (denoiser) parameterization.
 denoiser_p_mean: -1.5
