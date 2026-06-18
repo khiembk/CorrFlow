@@ -13,20 +13,25 @@ conda activate corrflow
 
 ```
 src/
-  train.py                          # Main training loop
-  train_step.py                     # Per-step loss (Stage 1: denoiser L2 + decoder CE)
+  train.py                          # Stage 1 training driver
+  train_step.py                     # Stage 1 per-step loss (denoiser L2 + decoder CE)
+  train_stage2.py                   # Stage 2 training driver
+  train_step_stage2.py              # Stage 2 per-step loss (GP path + CorrNetwork L2)
   generation.py                     # Inference / sampling
   eval.py                           # Evaluation
   modules/
     model.py                        # ELF_models dict (ELF-B/M/L backbones)
     layers.py                       # Transformer layers
     t5_encoder.py                   # Frozen T5 encoder
+    corr_network.py                 # CorrNetwork φ_η (CorrNet-S/M/L variants)
   configs/
     config.py                       # Config dataclass + YAML loader
     training_configs/               # Per-run YAML configs
+      train_corrflow_stage1_owt.yml
+      train_corrflow_stage2_owt.yml
     sampling_configs/               # Sampling sweep configs
   utils/
-    sampling_utils.py               # add_noise, sample_timesteps, ODE/SDE samplers
+    sampling_utils.py               # add_noise, sample_timesteps, sample_gp_path, ODE/SDE samplers
     train_utils.py                  # TrainState, optimizer, LR schedule
     data_utils.py                   # Dataloader, batch prep
     encoder_utils.py                # encode_text
@@ -65,7 +70,7 @@ python train.py --config configs/training_configs/train_corrflow_stage1_owt.yml
 
 **Output:** `outputs/corrflow_stage1-owt/`
 
-### Stage 2 — Correlation network `φ_η` (NOT YET IMPLEMENTED)
+### Stage 2 — Correlation network `φ_η`
 
 Freeze θ; train `φ_η` so that `v_con = v_ind + φ_η(...)` matches the GP-path velocity.
 
@@ -75,7 +80,20 @@ Freeze θ; train `φ_η` so that `v_con = v_ind + φ_η(...)` matches the GP-pat
 - Loss: `L_con = E[Σ_i ||v_con,i − v_gp,i||²]`
 - Context window: `C_i = {j | max(1, i−q) ≤ j < i}`
 
-**Still needed:** GP path construction, GP velocity derivation, correlation network `φ_η` module.
+**Architecture (Option A — causal conv + AdaLN):**
+- Input proj → N × (AdaLN + causal depthwise conv, kernel=q + pointwise + silu + residual) → zero-init output proj
+- Time conditioning: sinusoidal embedding → MLP → (γ, β) FiLM applied as `(1+γ)·RMSNorm(x) + β`
+- Strictly causal: output[i] sees only input[i−q : i] via left-zero-padding before each conv
+- Variants: `CorrNet-S` (h=128, 2L), `CorrNet-M` (h=256, 2L), `CorrNet-L` (h=512, 4L)
+
+**Config:** `src/configs/training_configs/train_corrflow_stage2_owt.yml`
+
+```bash
+cd src
+python train_stage2.py --config configs/training_configs/train_corrflow_stage2_owt.yml
+```
+
+**Output:** `outputs/corrflow_stage2-owt/`
 
 ## Key notation
 
@@ -95,8 +113,11 @@ Freeze θ; train `φ_η` so that `v_con = v_ind + φ_η(...)` matches the GP-pat
 ## Running commands
 
 ```bash
-# Stage 1 training
+# Stage 1 training (independent velocity field v_ind,θ)
 cd src && python train.py --config configs/training_configs/train_corrflow_stage1_owt.yml
+
+# Stage 2 training (correlation network φ_η — requires completed Stage 1)
+cd src && python train_stage2.py --config configs/training_configs/train_corrflow_stage2_owt.yml
 
 # Override config values
 python train.py --config configs/training_configs/train_corrflow_stage1_owt.yml \
@@ -110,6 +131,7 @@ python eval.py
 ## Notes
 
 - "ELF paper" = arXiv:2605.10938, Hu et al. 2026 — the base embedding-flow model this builds on
-- `train_step.py` implements Stage 1 exactly; Stage 2 train step does not exist yet
-- The model backbone (`ELF-B/M/L`) is reused for Stage 1; Stage 2 adds `φ_η` on top
-- JAX distributed init is handled in `train.py`; single-host runs work without flags
+- `train_step.py` implements Stage 1 exactly; `train_step_stage2.py` implements Stage 2
+- The model backbone (`ELF-B/M/L`) is reused for Stage 1; Stage 2 adds `φ_η` (`corr_network.py`) on top
+- JAX distributed init is handled in both drivers; single-host runs work without flags
+- `backbone_checkpoint` in Stage 2 config points to the Stage 1 output dir; EMA params are loaded
