@@ -354,68 +354,105 @@ def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
     B, L, d = x0.shape
 
     # ------------------------------------------------------------------ kernel
-    # Content-based, time-dependent GP kernel:
-    #   K(xa, xb, t) = (1-t) * exp(-gp_rho * (1 - cos_sim(xa, xb)))
+    # Autoregressive GP over interpolants z^i_t.
     #
-    # The GP conditions token i's noise on [t, x_1, ..., x_{j<i}]:
-    #   - K(xi, xi, t) = (1-t): auto-variance → 0 at t=1 (no noise needed at data)
-    #   - High content similarity → high correlation between token noises
-    #   - Orthogonal tokens (cos_sim ≈ 0) → K ≈ (1-t)*exp(-gp_rho), near-independent
-    #   - gp_rho controls content sensitivity (larger = falls off faster with dissimilarity)
-    def _k(xa, xb):
-        """Per-batch kernel K(xa, xb, t).  xa, xb: (B, d). → (B,)."""
-        xa_n = xa / (jnp.linalg.norm(xa, axis=-1, keepdims=True) + 1e-8)
-        xb_n = xb / (jnp.linalg.norm(xb, axis=-1, keepdims=True) + 1e-8)
-        cos_sim = jnp.sum(xa_n * xb_n, axis=-1)                      # (B,)
-        return (1.0 - t) * jnp.exp(-gp_rho * (1.0 - cos_sim))       # (B,)
+    # Notation (flow matching):
+    #   z^i_1 = x_i          (clean embedding at t=1)
+    #   z^i_0 ~ N(0, σ²I)    (noise at t=0)
+    #   z^i_t = t·z^i_1 + (1-t)·z^i_0   (interpolant)
+    #
+    # GP model:  y = z^i_t ~ GP( x = [t, z^{i-q}_t, ..., z^{i-1}_t] )
+    #
+    # The GP input for token i is its CONTEXT WINDOW — the previous q
+    # interpolants at the same time t.  Two positions are "similar" when
+    # their context windows are similar, making their noise correlated.
+    #
+    # Kernel:  K(f_a, f_b) = exp(-‖f_a - f_b‖² / gp_rho)
+    #   where f = unit-normalise each z in the window, then concatenate.
+    #   Unit-normalising keeps each slot's contribution in [0,2], so the
+    #   full window distance is in [0, 4·q] and gp_rho is interpretable.
+    #   Diagonal K(f,f) = 0  ← empty window, K(f,f) = 1 ← filled window.
+    #   Wait: K(f_i, f_i) = exp(0) = 1  always, so diagonal = 1. ✓
+    #
+    # Carry:  (buf_eps, buf_z, buf_f, idx)
+    #   buf_eps: (q, B, d)     — GP noise eps_j for last q positions
+    #   buf_z:   (q, B, d)     — interpolants z^j_t for last q positions
+    #   buf_f:   (q, B, q*d)   — context features f_j stored when j was processed
+    #   idx:     scalar int    — step counter
+    #
+    # At step i:
+    #   f_i = concat( unit_norm(buf_z[0]), ..., unit_norm(buf_z[q-1]) )
+    #        = the context window CURRENTLY in buf_z  (shape B × q·d)
+    #   Cross-kernel  k_cross[k] = K(f_i, buf_f[k])
+    #   Context kernel K_ctx[k,l] = K(buf_f[k], buf_f[l])
+    #   GP posterior → eps_i ~ N(mu, sigma²)
+    #   z^i_t = t·x_i + (1-t)·eps_i·noise_scale
+    #   Push (eps_i, z^i_t, f_i) into sliding buffers.
+    #
+    # Token 0 (no context): all buffers zero, active mask zeros out
+    # k_cross → alpha=0 → mu=0, sigma=1 → eps_0 ~ N(0,I) → linear interp. ✓
+
+    fd = gp_q * d   # feature dimension
+
+    def _feat(zw):
+        """Unit-normalise each latent in window and concatenate.
+        zw: (gp_q, B, d) → (B, gp_q*d)."""
+        zn = zw / (jnp.linalg.norm(zw, axis=-1, keepdims=True) + 1e-8)
+        return zn.transpose(1, 0, 2).reshape(B, fd)
+
+    def _k(fa, fb):
+        """RBF on concatenated context features.  fa, fb: (B, gp_q*d). → (B,)."""
+        sq_dist = jnp.sum((fa - fb) ** 2, axis=-1)   # (B,), ∈ [0, 4*gp_q]
+        return jnp.exp(-sq_dist / gp_rho)             # (B,)
 
     # ------------------------------------------------------------------ scan
     def step_fn(carry, inputs):
-        buf_eps, buf_x, idx = carry
-        # buf_eps: (gp_q, B, d) — sliding window of correlated noise eps_gp
-        # buf_x:   (gp_q, B, d) — sliding window of clean token embeddings x
-        noise_i, x_i = inputs                       # (B, d) each
+        buf_eps, buf_z, buf_f, idx = carry
+        noise_i, x_i = inputs                         # (B, d) each
 
         c = jnp.minimum(idx, jnp.int32(gp_q))
-        # active[q] = True for the c rightmost (filled) buffer slots
-        active = jnp.arange(gp_q) >= (gp_q - c)   # (gp_q,) bool
+        active = jnp.arange(gp_q) >= (gp_q - c)     # (gp_q,) bool
 
-        # Cross-kernel: k_cross[q, b] = K(x_i[b], buf_x[q, b], t[b])
-        k_cross = jax.vmap(lambda xb_q: _k(x_i, xb_q))(buf_x)      # (gp_q, B)
-        k_cross = k_cross * active[:, None]          # zero inactive slots
+        # Context feature for current token i: concatenation of current window
+        f_i = _feat(buf_z)                            # (B, gp_q*d)
 
-        # Context kernel: K_ctx[p, q, b] = K(buf_x[p,b], buf_x[q,b], t[b])
+        # Cross-kernel: K(f_i, stored feature of each context position)
+        k_cross = jax.vmap(lambda fb_q: _k(f_i, fb_q))(buf_f)  # (gp_q, B)
+        k_cross = k_cross * active[:, None]
+
+        # Context kernel: K between stored features of context positions
         K_ctx = jax.vmap(
-            lambda xp: jax.vmap(lambda xq: _k(xp, xq))(buf_x)
-        )(buf_x)                                     # (gp_q, gp_q, B)
+            lambda fp: jax.vmap(lambda fq: _k(fp, fq))(buf_f)
+        )(buf_f)                                       # (gp_q, gp_q, B)
 
-        # Inactive slots → identity so inversion is well-conditioned
-        act2d = (active[:, None] * active[None, :]).astype(jnp.float32)  # (gp_q, gp_q)
+        act2d = (active[:, None] * active[None, :]).astype(jnp.float32)
         eye_q = jnp.eye(gp_q)
         K_ctx = K_ctx * act2d[:, :, None] + (eye_q * (1.0 - act2d))[:, :, None]
-        K_ctx = K_ctx + 1e-8 * eye_q[:, :, None]    # regularise
+        K_ctx = K_ctx + 1e-2 * eye_q[:, :, None]     # diagonal=1 → cond ≤ q/ε
 
-        # Per-sample GP posterior (batched matrix inversion)
-        K_inv     = jax.vmap(jnp.linalg.inv)(K_ctx.transpose(2, 0, 1))  # (B,gp_q,gp_q)
-        k_cross_b = k_cross.transpose(1, 0)                               # (B, gp_q)
-        alpha     = jnp.einsum('bq,bqr->br', k_cross_b, K_inv)           # (B, gp_q)
+        K_ctx_b   = K_ctx.transpose(2, 0, 1)          # (B, gp_q, gp_q)
+        k_cross_b = k_cross.transpose(1, 0)            # (B, gp_q)
+        alpha     = jax.vmap(jnp.linalg.solve)(K_ctx_b, k_cross_b)   # (B, gp_q)
 
-        # Posterior variance: K(xi,xi,t) - alpha @ k_cross
-        k_auto = 1.0 - t                                          # (B,)
-        var    = k_auto - jnp.einsum('bq,bq->b', alpha, k_cross_b)  # (B,)
-        sigma  = jnp.sqrt(jnp.maximum(var, 0.0))                 # (B,)
+        # Posterior variance; prior K(f_i, f_i) = 1.0
+        var   = 1.0 - jnp.einsum('bq,bq->b', alpha, k_cross_b)   # (B,)
+        sigma = jnp.sqrt(jnp.maximum(var, 0.0))                   # (B,)
 
-        # Posterior mean + scaled innovation
-        mu    = jnp.einsum('bq,qbd->bd', alpha, buf_eps)         # (B, d)
-        eps_i = mu + sigma[:, None] * noise_i                     # (B, d)
+        mu    = jnp.einsum('bq,qbd->bd', alpha, buf_eps)    # (B, d)
+        eps_i = mu + sigma[:, None] * noise_i                # (B, d)
+
+        # Interpolant z^i_t — stored as context for future tokens
+        z_i = t[:, None] * x_i + (1.0 - t[:, None]) * eps_i * noise_scale
 
         new_buf_eps = jnp.concatenate([buf_eps[1:], eps_i[None]], axis=0)
-        new_buf_x   = jnp.concatenate([buf_x[1:],   x_i[None]],  axis=0)
-        return (new_buf_eps, new_buf_x, idx + 1), eps_i
+        new_buf_z   = jnp.concatenate([buf_z[1:],   z_i[None]],  axis=0)
+        new_buf_f   = jnp.concatenate([buf_f[1:],   f_i[None]],  axis=0)
+        return (new_buf_eps, new_buf_z, new_buf_f, idx + 1), eps_i
 
     init_carry = (
-        jnp.zeros((gp_q, B, d), dtype=x0.dtype),  # buf_eps
-        jnp.zeros((gp_q, B, d), dtype=x0.dtype),  # buf_x
+        jnp.zeros((gp_q, B, d),  dtype=x0.dtype),    # buf_eps
+        jnp.zeros((gp_q, B, d),  dtype=x0.dtype),    # buf_z
+        jnp.zeros((gp_q, B, fd), dtype=x0.dtype),    # buf_f
         jnp.array(0, dtype=jnp.int32),
     )
     noise_T = noise.transpose(1, 0, 2)             # (L, B, d)
