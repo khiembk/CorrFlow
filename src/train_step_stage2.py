@@ -106,6 +106,7 @@ def train_step_stage2(
         gp_kernel=config.gp_kernel,
         noise_scale=config.denoiser_noise_scale,
         cond_seq_mask=cond_seq_mask,
+        split_at=getattr(config, 'max_input_length', None),
     )  # z_gp: (B, L, d), v_gp: (B, L, d)
 
     # ------------------------------------------------------------------ backbone input

@@ -9,8 +9,8 @@
 #   python train.py --config configs/training_configs/train_corrflow_stage1_wmt14.yml
 
 # Dataset (local, pre-encoded with T5; downloaded from embedded-language-flows HF org)
-data_path: "/scratch/user/u.kt348068/data/wmt14_de-en_train_t5"
-eval_data_path: "/scratch/user/u.kt348068/data/wmt14_de-en_validation_t5"
+data_path: "/home.na1/ad.wsu.edu/khiem.tran/pvt/data/wmt14_de-en_train_t5"
+eval_data_path: "/home.na1/ad.wsu.edu/khiem.tran/pvt/data/wmt14_de-en_validation_t5"
 max_length: 128         # total sequence length: 64 source + 64 target tokens
 max_input_length: 64    # source (German) length; remainder is target (English)
 pad_token: eos          # WMT14 uses EOS as padding (no dedicated pad token)

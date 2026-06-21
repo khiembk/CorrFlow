@@ -260,7 +260,7 @@ def _sde_step(
 # ============================================
 
 def _gp_tables(gp_q: int, gp_rho: float, gp_kernel: str = 'rbf'):
-    """Precompute GP posterior weights for context sizes 0..gp_q.
+    """Precompute GP posterior weights for context sizes 0..gp_q (NumPy, static).
 
     Supports two kernels parameterised by gp_rho (= adjacent-token correlation):
       'rbf':         K(i,j) = gp_rho^(|i-j|^2)  — non-Markov; q>1 adds new info.
@@ -305,8 +305,10 @@ def _gp_tables(gp_q: int, gp_rho: float, gp_kernel: str = 'rbf'):
     return alpha, sigma
 
 
+
+
 def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
-                   noise_scale=1.0, cond_seq_mask=None):
+                   noise_scale=1.0, cond_seq_mask=None, split_at=None):
     """Construct the GP-correlated path and velocity target for Stage 2 training.
 
     Each token's correlated noise eps_gp^i is drawn from the GP posterior conditioned
@@ -338,6 +340,11 @@ def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
         gp_kernel:     'rbf' (default) or 'exponential'.
         noise_scale:   Global noise scale (matches denoiser_noise_scale in config).
         cond_seq_mask: Optional (B, L, 1) mask — cond tokens pinned to clean x0.
+        split_at:      Optional int — if set, run two independent GP scans:
+                       tokens [0, split_at) form one path, [split_at, L) form another.
+                       Each segment resets the sliding buffer at its own position 0,
+                       so no GP correlation bleeds across the boundary.
+                       Intended for bilingual sequences (source | target).
 
     Returns:
         z_gp:   (B, L, d) GP-path latent at time t.
@@ -346,47 +353,92 @@ def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
     """
     B, L, d = x0.shape
 
-    # Precompute GP tables in NumPy — runs at trace time, becomes JAX constants.
-    alpha_np, sigma_np = _gp_tables(gp_q, gp_rho, gp_kernel)
-    alpha_tbl = jnp.array(alpha_np, dtype=x0.dtype)   # (gp_q+1, gp_q)
-    sigma_tbl = jnp.array(sigma_np, dtype=x0.dtype)   # (gp_q+1,)
+    # ------------------------------------------------------------------ kernel
+    # Content-based, time-dependent GP kernel:
+    #   K(xa, xb, t) = (1-t) * exp(-gp_rho * (1 - cos_sim(xa, xb)))
+    #
+    # The GP conditions token i's noise on [t, x_1, ..., x_{j<i}]:
+    #   - K(xi, xi, t) = (1-t): auto-variance → 0 at t=1 (no noise needed at data)
+    #   - High content similarity → high correlation between token noises
+    #   - Orthogonal tokens (cos_sim ≈ 0) → K ≈ (1-t)*exp(-gp_rho), near-independent
+    #   - gp_rho controls content sensitivity (larger = falls off faster with dissimilarity)
+    def _k(xa, xb):
+        """Per-batch kernel K(xa, xb, t).  xa, xb: (B, d). → (B,)."""
+        xa_n = xa / (jnp.linalg.norm(xa, axis=-1, keepdims=True) + 1e-8)
+        xb_n = xb / (jnp.linalg.norm(xb, axis=-1, keepdims=True) + 1e-8)
+        cos_sim = jnp.sum(xa_n * xb_n, axis=-1)                      # (B,)
+        return (1.0 - t) * jnp.exp(-gp_rho * (1.0 - cos_sim))       # (B,)
 
-    def step_fn(carry, noise_i):
-        buf, idx = carry  # buf: (gp_q, B, d) sliding window; idx: () int32
+    # ------------------------------------------------------------------ scan
+    def step_fn(carry, inputs):
+        buf_eps, buf_x, idx = carry
+        # buf_eps: (gp_q, B, d) — sliding window of correlated noise eps_gp
+        # buf_x:   (gp_q, B, d) — sliding window of clean token embeddings x
+        noise_i, x_i = inputs                       # (B, d) each
 
-        # How many real (non-zero) entries are in buf at this step.
         c = jnp.minimum(idx, jnp.int32(gp_q))
+        # active[q] = True for the c rightmost (filled) buffer slots
+        active = jnp.arange(gp_q) >= (gp_q - c)   # (gp_q,) bool
 
-        # Dynamic gather: select the row for context size c.
-        alpha = alpha_tbl[c]   # (gp_q,)
-        sigma = sigma_tbl[c]   # ()
+        # Cross-kernel: k_cross[q, b] = K(x_i[b], buf_x[q, b], t[b])
+        k_cross = jax.vmap(lambda xb_q: _k(x_i, xb_q))(buf_x)      # (gp_q, B)
+        k_cross = k_cross * active[:, None]          # zero inactive slots
 
-        # GP posterior mean from the sliding window.
-        # buf[gp_q-c:] holds the c real eps_gp values (oldest→newest);
-        # alpha is right-aligned so buf[0:gp_q-c] multiplied by 0 padding.
-        mu = jnp.einsum('q,qbd->bd', alpha, buf)   # (B, d)
+        # Context kernel: K_ctx[p, q, b] = K(buf_x[p,b], buf_x[q,b], t[b])
+        K_ctx = jax.vmap(
+            lambda xp: jax.vmap(lambda xq: _k(xp, xq))(buf_x)
+        )(buf_x)                                     # (gp_q, gp_q, B)
 
-        # Sample correlated noise for token i.
-        eps_i = mu + sigma * noise_i               # (B, d)
+        # Inactive slots → identity so inversion is well-conditioned
+        act2d = (active[:, None] * active[None, :]).astype(jnp.float32)  # (gp_q, gp_q)
+        eye_q = jnp.eye(gp_q)
+        K_ctx = K_ctx * act2d[:, :, None] + (eye_q * (1.0 - act2d))[:, :, None]
+        K_ctx = K_ctx + 1e-8 * eye_q[:, :, None]    # regularise
 
-        # Slide buffer: drop oldest, append newest at the right.
-        new_buf = jnp.concatenate([buf[1:], eps_i[None]], axis=0)
+        # Per-sample GP posterior (batched matrix inversion)
+        K_inv     = jax.vmap(jnp.linalg.inv)(K_ctx.transpose(2, 0, 1))  # (B,gp_q,gp_q)
+        k_cross_b = k_cross.transpose(1, 0)                               # (B, gp_q)
+        alpha     = jnp.einsum('bq,bqr->br', k_cross_b, K_inv)           # (B, gp_q)
 
-        return (new_buf, idx + 1), eps_i
+        # Posterior variance: K(xi,xi,t) - alpha @ k_cross
+        k_auto = 1.0 - t                                          # (B,)
+        var    = k_auto - jnp.einsum('bq,bq->b', alpha, k_cross_b)  # (B,)
+        sigma  = jnp.sqrt(jnp.maximum(var, 0.0))                 # (B,)
 
-    init_buf = jnp.zeros((gp_q, B, d), dtype=x0.dtype)
-    init_idx = jnp.array(0, dtype=jnp.int32)
+        # Posterior mean + scaled innovation
+        mu    = jnp.einsum('bq,qbd->bd', alpha, buf_eps)         # (B, d)
+        eps_i = mu + sigma[:, None] * noise_i                     # (B, d)
 
-    # Scan over L token positions; noise is (B, L, d) → transposed to (L, B, d).
-    _, eps_gp_T = jax.lax.scan(
-        step_fn,
-        (init_buf, init_idx),
-        noise.transpose(1, 0, 2),   # (L, B, d)
+        new_buf_eps = jnp.concatenate([buf_eps[1:], eps_i[None]], axis=0)
+        new_buf_x   = jnp.concatenate([buf_x[1:],   x_i[None]],  axis=0)
+        return (new_buf_eps, new_buf_x, idx + 1), eps_i
+
+    init_carry = (
+        jnp.zeros((gp_q, B, d), dtype=x0.dtype),  # buf_eps
+        jnp.zeros((gp_q, B, d), dtype=x0.dtype),  # buf_x
+        jnp.array(0, dtype=jnp.int32),
     )
-    eps_gp = eps_gp_T.transpose(1, 0, 2)   # (B, L, d)
+    noise_T = noise.transpose(1, 0, 2)             # (L, B, d)
+    x0_T    = x0.transpose(1, 0, 2)               # (L, B, d)
 
-    # Build path and velocity.
-    t_e = t.reshape(-1, 1, 1)
+    if split_at is not None:
+        # Two independent GP paths: source [0, split_at) and target [split_at, L).
+        # Fresh buffer reset at each language boundary.
+        _, eps_src_T = jax.lax.scan(
+            step_fn, init_carry, (noise_T[:split_at], x0_T[:split_at])
+        )
+        _, eps_tgt_T = jax.lax.scan(
+            step_fn, init_carry, (noise_T[split_at:], x0_T[split_at:])
+        )
+        eps_gp = jnp.concatenate(
+            [eps_src_T, eps_tgt_T], axis=0
+        ).transpose(1, 0, 2)                       # (B, L, d)
+    else:
+        _, eps_gp_T = jax.lax.scan(step_fn, init_carry, (noise_T, x0_T))
+        eps_gp = eps_gp_T.transpose(1, 0, 2)      # (B, L, d)
+
+    # Build path and velocity
+    t_e  = t.reshape(-1, 1, 1)
     z_gp = t_e * x0 + (1 - t_e) * eps_gp * noise_scale
     v_gp = x0 - eps_gp * noise_scale
 

@@ -11,8 +11,9 @@
 #   cd src
 #   python train_stage2.py --config configs/training_configs/train_corrflow_stage2_owt.yml
 
-# Dataset (same as Stage 1)
-data_path: "embedded-language-flows/openwebtext-t5"
+# Dataset (local, pre-encoded; downloaded from embedded-language-flows HF org)
+data_path: "/home.na1/ad.wsu.edu/khiem.tran/pvt/data/openwebtext-t5"
+eval_data_path: null   # OWT has no separate validation split
 max_length: 1024
 
 # Encoder (same as Stage 1 — frozen)
@@ -28,8 +29,9 @@ num_time_tokens: 4
 num_self_cond_cfg_tokens: 4
 num_model_mode_tokens: 4
 
-# Frozen Stage 1 checkpoint (EMA params are loaded and frozen)
-backbone_checkpoint: "outputs/corrflow_stage1-owt"
+# Frozen backbone: official ELF-B-owt pre-trained checkpoint (orbax ocdbt format).
+# train_stage2.py detects the format automatically and loads via orbax.
+backbone_checkpoint: "/home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/ELF-B-owt"
 
 # GP path — must match Stage 1 values so the velocity targets are consistent
 gp_q: 2           # context window size (token i conditions on previous gp_q tokens)

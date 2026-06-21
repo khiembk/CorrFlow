@@ -134,10 +134,12 @@ class CorrNetwork(nn.Module):
 # ---------------------------------------------------------------------------
 def CorrNetwork_S(**kwargs): return CorrNetwork(hidden_dim=128, num_layers=2, **kwargs)
 def CorrNetwork_M(**kwargs): return CorrNetwork(hidden_dim=256, num_layers=2, **kwargs)
+def CorrNetwork_XL(**kwargs): return CorrNetwork(hidden_dim=512, num_layers=2, **kwargs)
 def CorrNetwork_L(**kwargs): return CorrNetwork(hidden_dim=512, num_layers=4, **kwargs)
 
 CorrNetwork_models = {
     'CorrNet-S': CorrNetwork_S,
     'CorrNet-M': CorrNetwork_M,
+    'CorrNet-XL': CorrNetwork_XL,
     'CorrNet-L': CorrNetwork_L,
 }
