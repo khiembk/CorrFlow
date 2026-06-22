@@ -34,9 +34,9 @@ num_model_mode_tokens: 4
 backbone_checkpoint: "/home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/ELF-B-de-en"
 
 # GP path — tune gp_rho / gp_q to control inter-token correlation
-gp_q: 8
-gp_rho: 0.5
-gp_kernel: rbf
+gp_q: 4
+gp_rho: 10.0
+gp_kernel: content
 
 # CorrNetwork φ_η architecture
 corr_model: CorrNet-XL  # h=512, 2L ~ 2M params
@@ -79,7 +79,7 @@ hf_repo_id: null
 resume: null
 
 # Wandb
-use_wandb: false
+use_wandb: true
 wandb_project: corrflow
 wandb_entity: null
 wandb_run_name: corrflow_stage2-wmt14

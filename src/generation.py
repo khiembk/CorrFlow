@@ -160,9 +160,9 @@ def test_generation_uncond(
                 t_rng, num_local_devices, num_sampling_steps, time_schedule, config,
             )
             z_sharded = _shard_noise(
-                device_rngs, num_local_devices, current_per_device,
-                config.max_length, d_model, config.denoiser_noise_scale,
-            )
+                    device_rngs, num_local_devices, current_per_device,
+                    config.max_length, d_model, config.denoiser_noise_scale,
+                )
 
             gen_start = time.time()
             latent_sharded = p_generate(
@@ -395,9 +395,9 @@ def test_generation_cond(
             cond_seq_mask_sharded = cond_seq_mask_arr.reshape(num_local_devices, current_per_device, -1)
 
             z_sharded = _shard_noise(
-                device_rngs, num_local_devices, current_per_device,
-                max_length, d_model, config.denoiser_noise_scale,
-            )
+                    device_rngs, num_local_devices, current_per_device,
+                    max_length, d_model, config.denoiser_noise_scale,
+                )
 
             gen_start = time.time()
             latent_sharded = p_generate(
