@@ -15,6 +15,7 @@
 data_path: "/home.na1/ad.wsu.edu/khiem.tran/pvt/data/openwebtext-t5"
 eval_data_path: null   # OWT has no separate validation split
 max_length: 1024
+pad_token: eos
 
 # Encoder (same as Stage 1 — frozen)
 encoder_model_name: t5-small
@@ -33,13 +34,13 @@ num_model_mode_tokens: 4
 # train_stage2.py detects the format automatically and loads via orbax.
 backbone_checkpoint: "/home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/ELF-B-owt"
 
-# GP path — must match Stage 1 values so the velocity targets are consistent
-gp_q: 2           # context window size (token i conditions on previous gp_q tokens)
-gp_rho: 0.5       # adjacent-token correlation for the RBF kernel
-gp_kernel: rbf    # K(i,j) = gp_rho^(|i-j|^2); non-Markov, gp_q > 1 is meaningful
+# GP path — tune gp_rho / gp_q to control inter-token correlation
+gp_q: 4
+gp_rho: 3.0
+gp_kernel: content
 
 # CorrNetwork φ_η architecture
-corr_model: CorrNet-M   # CorrNet-S (h=128,L=2), CorrNet-M (h=256,L=2), CorrNet-L (h=512,L=4)
+corr_model: CorrNet-XL  # h=512, 2L ~2M params
 
 # Denoiser time schedule (Stage 2 uses same sampling as Stage 1 for z_gp)
 denoiser_p_mean: -1.5
@@ -48,17 +49,19 @@ denoiser_noise_scale: 2.0
 t_eps: 0.05
 time_schedule: "logit_normal"
 
-# Backbone self-conditioning settings (must match Stage 1 — used to configure the
-# zero self-cond input passed to the frozen backbone during Stage 2 forward passes)
+# Backbone self-conditioning (must match ELF-B-owt training settings)
 self_cond_prob: 0.5
+label_drop_prob: 0.0
 
 # Training
-epochs: 3
-global_batch_size: 512
-blr: 0.001          # same base LR as Stage 1; CorrNet zero-init means safe to keep high
+epochs: 5
+max_steps: 15000
+global_batch_size: 256
+generation_batch_size: 64
+blr: 0.0005
 weight_decay: 0.0
-warmup_epochs: 0.1
-warmup_steps: -1
+warmup_steps: 500
+warmup_epochs: -1
 optimizer: muon
 
 # EMA
@@ -67,6 +70,12 @@ ema_decay1: 0.9999
 # Sampling (evaluation uses the full composed model v_con = v_ind + delta_v)
 sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
 num_samples: 1000
+
+# PPL / Entropy evaluation (unconditional — no reference text needed)
+online_eval: true
+eval_ppl_model: "gpt2-large"
+eval_ppl_batch_size: 32
+eval_ppl_max_length: 1024
 
 # Logging & Checkpointing
 log_freq: 100

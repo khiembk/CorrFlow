@@ -241,6 +241,8 @@ def run_training(config):
 
     steps_per_epoch = len(train_dataset) // total_batch_size
     num_train_steps = steps_per_epoch * config.epochs
+    if config.max_steps is not None:
+        num_train_steps = min(num_train_steps, config.max_steps)
     if config.warmup_steps >= 0:
         num_warmup_steps = config.warmup_steps
     elif config.warmup_epochs is not None:
@@ -420,6 +422,9 @@ def run_training(config):
             global_step += 1
             epoch_pbar.update(1)
 
+            if config.max_steps is not None and global_step >= config.max_steps:
+                break
+
             if global_step % config.log_freq == 0:
                 jax.tree_util.tree_map(lambda x: x.block_until_ready(), corr_state.params)
                 gathered = get_metrics(train_metrics)
@@ -472,10 +477,14 @@ def run_training(config):
             save_checkpoint(corr_state, config.output_dir, global_step, hf_repo_id=config.hf_repo_id)
             log_for_0(f"Saved Stage 2 checkpoint at epoch {current_epoch} (step {global_step})")
 
+        if config.max_steps is not None and global_step >= config.max_steps:
+            log_for_0(f"Reached max_steps={config.max_steps}, stopping training.")
+            break
+
         # ---- Generation eval (v_con = v_ind + phi_eta; decode step unchanged) ----
+        # For unconditional tasks (eval_dataset is None), still run eval to get PPL/entropy.
         do_eval = (
-            eval_dataset is not None
-            and config.sampling_configs
+            config.sampling_configs
             and config.eval_freq > 0
             and current_epoch % config.eval_freq == 0
         )
@@ -504,6 +513,7 @@ def run_training(config):
             )
             backbone_state_for_gen_rep = jax_utils.replicate(backbone_state_for_gen)
 
+            gen_batch_size = config.generation_batch_size or local_batch_size
             rng = run_generation(
                 state=backbone_state_for_gen_rep,
                 encoder_params=encoder_params,
@@ -512,7 +522,7 @@ def run_training(config):
                 tokenizer=tokenizer,
                 config=config,
                 rng=gen_rng,
-                local_batch_size=local_batch_size,
+                local_batch_size=gen_batch_size,
                 corr_apply_fn=corr_model.apply,
                 corr_params=corr_unreplicated.ema_params1,
             )

@@ -34,12 +34,12 @@ num_model_mode_tokens: 4
 backbone_checkpoint: "/home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/ELF-B-xsum"
 
 # GP path — tune gp_rho / gp_q to control inter-token correlation
-gp_q: 2
-gp_rho: 0.5
-gp_kernel: rbf
+gp_q: 4
+gp_rho: 3.0
+gp_kernel: content
 
 # CorrNetwork φ_η architecture
-corr_model: CorrNet-M   # CorrNet-S (h=128,L=2) / CorrNet-M (h=256,L=2) / CorrNet-L (h=512,L=4)
+corr_model: CorrNet-XL  # h=512, 2L ~2M params
 
 # Denoiser time schedule (must match Stage 1 / backbone training settings)
 denoiser_p_mean: -1.5
@@ -53,9 +53,10 @@ self_cond_prob: 0.5
 label_drop_prob: 0.1
 
 # Training
-epochs: 3
-global_batch_size: 512
-blr: 0.001
+epochs: 5
+global_batch_size: 256
+generation_batch_size: 128
+blr: 0.0005
 weight_decay: 0.0
 warmup_steps: 500
 warmup_epochs: -1

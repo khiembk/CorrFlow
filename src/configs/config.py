@@ -96,6 +96,8 @@ class Config:
     adam_b1: float = 0.9
     adam_b2: float = 0.95
     grad_accum_steps: int = 1  # Gradient accumulation steps (optimizer updates every K mini-batches)
+    generation_batch_size: int = None  # Override batch size for generation eval (defaults to global_batch_size)
+    max_steps: int = None              # Hard cap on total training steps (overrides epochs)
 
     # EMA
     ema_decay1: float = 0.9999

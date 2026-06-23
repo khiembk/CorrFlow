@@ -58,14 +58,16 @@ def parse_args():
     parser.add_argument("--config_override", action="append", default=[])
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to specific CorrNetwork checkpoint. Default: latest in output_dir.")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Run backbone-only (no CorrNet) baseline eval.")
     return parser.parse_args()
 
 
-def run_eval(config, ckpt_path=None):
+def run_eval(config, ckpt_path=None, baseline=False):
     log_for_0("=" * 60)
     log_for_0("CorrFlow Stage 2 — Eval Only")
     log_for_0("=" * 60)
-    log_for_0(f"corr_infer : {config.corr_infer}")
+    log_for_0(f"Mode: {'BASELINE (backbone only)' if baseline else 'CorrNet'}")
     log_for_0(f"gp_q={config.gp_q}, gp_rho={config.gp_rho}")
     log_for_0(f"CorrNetwork: {config.corr_model}")
     log_for_0("=" * 60)
@@ -90,7 +92,9 @@ def run_eval(config, ckpt_path=None):
 
     # Batch sizing (for eval only; local_batch_size drives generation loop)
     num_hosts = jax.process_count()
-    if config.global_batch_size is not None:
+    if config.generation_batch_size is not None:
+        local_batch_size = config.generation_batch_size // num_hosts
+    elif config.global_batch_size is not None:
         local_batch_size = config.global_batch_size // num_hosts
     elif config.batch_size is not None:
         local_batch_size = config.batch_size * jax.local_device_count()
@@ -111,34 +115,40 @@ def run_eval(config, ckpt_path=None):
     frozen_backbone_params = load_frozen_backbone(config, backbone_model, backbone_rng, d_model)
     frozen_backbone_params = jax_utils.replicate(frozen_backbone_params)
 
-    # CorrNetwork — init then load checkpoint
-    log_for_0(f"Initialising CorrNetwork ({config.corr_model}, gp_q={config.gp_q})...")
-    corr_model = CorrNetwork_models[config.corr_model](gp_q=config.gp_q)
-    rng, init_rng, dropout_rng = jax.random.split(rng, 3)
-    dummy_v_ind = jnp.ones((1, config.max_length, d_model))
-    dummy_t = jnp.ones((1,))
-    corr_params_init = corr_model.init(init_rng, dummy_v_ind, dummy_t)
+    # CorrNetwork — optionally load for Stage 2 eval; skip for baseline
+    corr_apply_fn = None
+    corr_params_for_gen = None
+    gen_step = 0
 
-    dummy_lr_fn = create_learning_rate_fn(num_train_steps=1, num_warmup_steps=0, learning_rate=1e-3)
-    dummy_optimizer = get_optimizer(config, dummy_lr_fn)
-    corr_state = TrainState.create(
-        apply_fn=corr_model.apply,
-        params=corr_params_init["params"],
-        tx=dummy_optimizer,
-        dropout_rng=dropout_rng,
-        ema_params1=copy.deepcopy(corr_params_init["params"]),
-    )
+    if not baseline:
+        log_for_0(f"Initialising CorrNetwork ({config.corr_model}, gp_q={config.gp_q})...")
+        corr_model = CorrNetwork_models[config.corr_model](gp_q=config.gp_q)
+        rng, init_rng, dropout_rng = jax.random.split(rng, 3)
+        dummy_v_ind = jnp.ones((1, config.max_length, d_model))
+        dummy_t = jnp.ones((1,))
+        corr_params_init = corr_model.init(init_rng, dummy_v_ind, dummy_t)
 
-    resolve_path = ckpt_path or find_latest_checkpoint(config.output_dir) or config.output_dir
-    log_for_0(f"Loading CorrNetwork checkpoint from {resolve_path}...")
-    corr_state, resume_step = load_checkpoint(resolve_path, corr_state)
-    log_for_0(f"Loaded CorrNetwork checkpoint at step {resume_step}")
+        dummy_lr_fn = create_learning_rate_fn(num_train_steps=1, num_warmup_steps=0, learning_rate=1e-3)
+        dummy_optimizer = get_optimizer(config, dummy_lr_fn)
+        corr_state = TrainState.create(
+            apply_fn=corr_model.apply,
+            params=corr_params_init["params"],
+            tx=dummy_optimizer,
+            dropout_rng=dropout_rng,
+            ema_params1=copy.deepcopy(corr_params_init["params"]),
+        )
 
-    corr_unreplicated = jax_utils.unreplicate(
-        jax_utils.replicate(corr_state)
-    ) if False else corr_state  # corr_state is already unreplicated here
+        resolve_path = ckpt_path or find_latest_checkpoint(config.output_dir) or config.output_dir
+        log_for_0(f"Loading CorrNetwork checkpoint from {resolve_path}...")
+        corr_state, resume_step = load_checkpoint(resolve_path, corr_state)
+        log_for_0(f"Loaded CorrNetwork checkpoint at step {resume_step}")
+        corr_apply_fn = corr_model.apply
+        corr_params_for_gen = corr_state.ema_params1
+        gen_step = corr_state.step
+    else:
+        log_for_0("Baseline mode: skipping CorrNetwork, using backbone only.")
 
-    # Build a backbone TrainState for generation (not replicated for .apply_fn; replicate for pmap)
+    # Build a backbone TrainState for generation
     dummy_lr_fn2 = create_learning_rate_fn(num_train_steps=1, num_warmup_steps=0, learning_rate=1e-3)
     dummy_optimizer2 = get_optimizer(config, dummy_lr_fn2)
     rng, gen_dropout_rng = jax.random.split(rng)
@@ -149,10 +159,7 @@ def run_eval(config, ckpt_path=None):
         dropout_rng=gen_dropout_rng,
         ema_params1=jax_utils.unreplicate(frozen_backbone_params),
     )
-    backbone_state = backbone_state.replace(
-        epoch=corr_state.epoch,
-        step=corr_state.step,
-    )
+    backbone_state = backbone_state.replace(step=gen_step)
     backbone_state_rep = jax_utils.replicate(backbone_state)
 
     rng, gen_rng = jax.random.split(rng)
@@ -165,8 +172,8 @@ def run_eval(config, ckpt_path=None):
         config=config,
         rng=gen_rng,
         local_batch_size=local_batch_size,
-        corr_apply_fn=corr_model.apply,
-        corr_params=corr_state.ema_params1,
+        corr_apply_fn=corr_apply_fn,
+        corr_params=corr_params_for_gen,
     )
 
 
@@ -175,7 +182,7 @@ def main():
     config = load_config_from_yaml(args.config)
     if args.config_override:
         config = apply_config_overrides(config, args.config_override)
-    run_eval(config, ckpt_path=args.checkpoint)
+    run_eval(config, ckpt_path=args.checkpoint, baseline=args.baseline)
 
 
 if __name__ == "__main__":
