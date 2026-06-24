@@ -477,10 +477,6 @@ def run_training(config):
             save_checkpoint(corr_state, config.output_dir, global_step, hf_repo_id=config.hf_repo_id)
             log_for_0(f"Saved Stage 2 checkpoint at epoch {current_epoch} (step {global_step})")
 
-        if config.max_steps is not None and global_step >= config.max_steps:
-            log_for_0(f"Reached max_steps={config.max_steps}, stopping training.")
-            break
-
         # ---- Generation eval (v_con = v_ind + phi_eta; decode step unchanged) ----
         # For unconditional tasks (eval_dataset is None), still run eval to get PPL/entropy.
         do_eval = (
@@ -526,6 +522,10 @@ def run_training(config):
                 corr_apply_fn=corr_model.apply,
                 corr_params=corr_unreplicated.ema_params1,
             )
+
+        if config.max_steps is not None and global_step >= config.max_steps:
+            log_for_0(f"Reached max_steps={config.max_steps}, stopping training.")
+            break
 
     log_for_0("\n" + "=" * 60)
     log_for_0("Stage 2 Training Complete")
