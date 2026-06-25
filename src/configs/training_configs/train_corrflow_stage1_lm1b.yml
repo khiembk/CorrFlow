@@ -35,11 +35,13 @@ decoder_p_std: 0.8
 self_cond_prob: 0.5
 
 epochs: 5
-global_batch_size: 512
+max_steps: 50000      # ~2.3h at 6 steps/sec; ~same compute as OWT Stage 1
+global_batch_size: 128
+grad_accum_steps: 4   # effective batch = 512, same LR scaling as ELF OWT
 blr: 0.001
 weight_decay: 0.0
-warmup_epochs: 0.5
-warmup_steps: -1
+warmup_steps: 5000
+warmup_epochs: -1
 optimizer: muon
 
 ema_decay1: 0.9999

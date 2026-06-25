@@ -185,6 +185,8 @@ def run_training(config):
 
     steps_per_epoch = len(train_dataset) // total_batch_size
     num_train_steps = steps_per_epoch * config.epochs
+    if config.max_steps is not None:
+        num_train_steps = min(num_train_steps, config.max_steps)
     if config.warmup_steps >= 0:
         num_warmup_steps = config.warmup_steps
     elif config.warmup_epochs is not None:
@@ -353,6 +355,9 @@ def run_training(config):
             global_step += 1
             epoch_pbar.update(1)
 
+            if config.max_steps is not None and global_step >= config.max_steps:
+                break
+
             if global_step % config.log_freq == 0:
                 jax.tree_util.tree_map(lambda x: x.block_until_ready(), state.params)
                 gathered = get_metrics(train_metrics)
@@ -417,6 +422,10 @@ def run_training(config):
             )
             last_log_step = global_step
             last_log_time = time.time()
+
+        if config.max_steps is not None and global_step >= config.max_steps:
+            log_for_0(f"Reached max_steps={config.max_steps}, stopping training.")
+            break
 
     log_for_0("\n" + "=" * 60)
     log_for_0("Final Generation")
