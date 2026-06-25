@@ -1,0 +1,68 @@
+# Stage 1: Train the independent velocity field v_ind,θ on LM1B (ELF recipe).
+# Unconditional language model — sentence-level, max_length=128.
+#
+# Run:
+#   cd src
+#   python train.py --config configs/training_configs/train_corrflow_stage1_lm1b.yml
+
+data_path: "/home.na1/ad.wsu.edu/khiem.tran/pvt/data/lm1b_train_t5"
+eval_data_path: "/home.na1/ad.wsu.edu/khiem.tran/pvt/data/lm1b_test_t5"
+max_length: 128
+pad_token: eos
+
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+model: ELF-B
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+decoder_prob: 0.2
+decoder_noise_scale: 5.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+self_cond_prob: 0.5
+
+epochs: 5
+global_batch_size: 512
+blr: 0.001
+weight_decay: 0.0
+warmup_epochs: 0.5
+warmup_steps: -1
+optimizer: muon
+
+ema_decay1: 0.9999
+
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+num_samples: 1000
+
+online_eval: true
+eval_ppl_model: "gpt2-large"
+eval_ppl_batch_size: 32
+eval_ppl_max_length: 256
+
+log_freq: 100
+save_freq: 1
+eval_freq: 1
+
+output_dir: "outputs/corrflow_stage1-lm1b"
+hf_repo_id: null
+resume: null
+
+use_wandb: true
+wandb_project: corrflow
+wandb_entity: null
+wandb_run_name: corrflow_stage1-lm1b
+
+seed: 42
