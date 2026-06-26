@@ -65,15 +65,16 @@ def run_generation(
             corr_apply_fn=corr_apply_fn,
             corr_params=corr_params,
         )
-        if eval_dataset is None:
-            test_generation_uncond(**common_kwargs)
-        else:
+        is_conditional = eval_dataset is not None and config.max_input_length is not None
+        if is_conditional:
             test_generation_cond(
                 **common_kwargs,
                 encoder_params=encoder_params,
                 encoder_apply_fn=encoder_apply_fn,
                 dataset=eval_dataset,
             )
+        else:
+            test_generation_uncond(**common_kwargs)
 
     return rng
 

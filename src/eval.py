@@ -231,15 +231,16 @@ def main():
                 batch_size=local_batch_size,
                 num_samples=config.num_samples,
             )
-            if eval_dataset is None:
-                test_generation_uncond(**common_kwargs)
-            else:
+            is_conditional = eval_dataset is not None and config.max_input_length is not None
+            if is_conditional:
                 test_generation_cond(
                     **common_kwargs,
                     encoder_params=encoder_params,
                     encoder_apply_fn=encoder_model.apply,
                     dataset=eval_dataset,
                 )
+            else:
+                test_generation_uncond(**common_kwargs)
 
         config.output_dir = original_output_dir
 
