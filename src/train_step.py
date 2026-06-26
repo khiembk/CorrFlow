@@ -72,11 +72,7 @@ def train_step(
 
     cond_seq_mask = batch["cond_seq_mask"][:, :, None]
     attention_mask = batch["attention_mask"]
-    if config.pad_token == "pad":
-        loss_mask = attention_mask
-    else:
-        loss_mask = jnp.ones_like(attention_mask)
-    loss_mask = loss_mask * (1 - batch["cond_seq_mask"])
+    loss_mask = attention_mask * (1 - batch["cond_seq_mask"])
 
     denoiser_z = add_noise(x0, noise, t, config, cond_seq_mask=cond_seq_mask)
 
