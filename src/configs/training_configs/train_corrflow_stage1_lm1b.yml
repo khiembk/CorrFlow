@@ -34,7 +34,7 @@ decoder_p_std: 0.8
 
 self_cond_prob: 0.5
 
-epochs: 3
+epochs: 5
 max_steps: null
 global_batch_size: 128
 grad_accum_steps: 4   # effective batch = 512, same LR scaling as ELF OWT
