@@ -485,6 +485,378 @@ def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
     return z_gp, v_gp, eps_gp
 
 
+# ============================================================
+# GP Path Correlation — path-direct formulation (new)
+# ============================================================
+#
+# TWO CORRELATION VARIANTS
+# ─────────────────────────────────────────────────────────────
+#
+#  NOISE CORRELATION (sample_gp_path / sample_gp_noise_correlation):
+#    GP correlates the source noise eps^{1:L}:
+#        eps_gp^i = alpha_i @ buf_eps + sigma_i * noise^i
+#        z_t^i    = t * x^i + (1-t) * eps_gp^i * σ
+#        v^i      = x^i − eps_gp^i * σ          (time-independent)
+#    Kernel: content-feature RBF on normalised z context; gp_rho is
+#    the kernel denominator (NOT a standard lengthscale).
+#
+#  PATH CORRELATION (sample_gp_path_correlation):
+#    GP directly models p(z_t^i | t, z_t^{C_i}):
+#        m_i(t)   = t * x^i + (1-t) * eps^i * σ  (linear mean)
+#        r_i(t)   = alpha_i(t) @ buf_residual + s(t) * sigma_i(t) * xi^i
+#        z_t^i    = m_i(t) + r_i(t)
+#        s(t)     = 4t(1-t)                        (bridge scale)
+#        v^i      = dz_t^i/dt                      (via jax.jvp)
+#    Kernel: standard RBF/exponential on context features f_i(t);
+#    gp_rho is treated as the kernel lengthscale l.
+#
+# SEPARABLE GP: K_full = K_token ⊗ I_d
+#   The scalar kernel K_token operates on token-level features
+#   f_i ∈ R^{1+q*d} = [t, unit_norm(z_{i-q}), ..., unit_norm(z_{i-1})].
+#   The same scalar GP weights α ∈ R^q apply to ALL d embedding dims.
+#
+# BACKWARD-COMPATIBILITY ALIAS
+sample_gp_noise_correlation = sample_gp_path
+
+
+# ---- helpers ----------------------------------------------------------
+
+def _bridge_scale(t):
+    """Bridge scale s(t) = 4*t*(1-t).
+
+    Ensures z_0^i = eps^i*σ and z_1^i = x^i by vanishing at the endpoints.
+    Peak s(0.5) = 1.0.
+    """
+    return 4.0 * t * (1.0 - t)
+
+
+def _path_kernel_fn(fa, fb, lengthscale, kernel):
+    """Scalar GP kernel on context-feature vectors (per token, per sample).
+
+    Args:
+        fa, fb:     (F,) feature vectors.
+        lengthscale: l > 0 — length scale parameter.
+        kernel:     'rbf' or 'exponential'.
+
+    Returns:
+        Scalar k(fa, fb).  k(fa, fa) = 1 for both kernels.
+
+    RBF:         k = exp(-‖fa − fb‖² / (2 l²))
+    Exponential: k = exp(-‖fa − fb‖   / l)
+
+    gp_rho in sample_gp_path_correlation is forwarded as lengthscale;
+    it plays a different role here (standard kernel lengthscale) than
+    in the noise-correlation formulation (kernel denominator).
+    """
+    diff = fa - fb
+    if kernel == 'rbf':
+        sq_dist = jnp.sum(diff ** 2)
+        return jnp.exp(-sq_dist / (2.0 * lengthscale ** 2))
+    elif kernel == 'exponential':
+        dist = jnp.sqrt(jnp.sum(diff ** 2) + 1e-12)
+        return jnp.exp(-dist / lengthscale)
+    else:
+        raise ValueError(
+            f"Unknown gp_kernel '{kernel}' for path correlation. "
+            "Choose 'rbf' or 'exponential'."
+        )
+
+
+def _path_context_feature_single(buf_z, t_scalar, active, gp_q):
+    """Context feature for a single token (single sample).
+
+    f_i(t) = concat[t, unit_norm(z_{i-q}(t)), ..., unit_norm(z_{i-1}(t))]
+    Inactive (start-of-sequence) slots are zeroed out.
+
+    Args:
+        buf_z:    (q, d) — last q z values, oldest first (buf_z[q-1] = z_{i-1}).
+        t_scalar: scalar — current timestep.
+        active:   (q,) bool — True for valid context slots.
+        gp_q:     int — context window size.
+
+    Returns: (1 + q*d,) feature vector.
+
+    Including t in the feature makes K(f_i, f_j) time-dependent, which
+    is necessary for the JVP to capture the time derivative of alpha_i(t).
+    """
+    # Unit-normalise each slot.
+    # Use sq_norm + eps (not norm + eps) so the JVP is 0 when buf_z=0 rather than
+    # 0/0 (NaN).  jnp.linalg.norm has grad = x/||x|| which is 0/0 at zeros;
+    # sqrt(sum(x²) + ε) has grad = x / sqrt(sum(x²)+ε) which is 0/sqrt(ε) at zeros.
+    sq_norms = jnp.sum(buf_z ** 2, axis=-1, keepdims=True)  # (q, 1)
+    z_norm = buf_z / jnp.sqrt(sq_norms + 1e-8)              # (q, d)
+    # Zero inactive slots (start of sequence, not yet filled)
+    z_norm = z_norm * active[:, None].astype(buf_z.dtype)
+    t_feat = jnp.reshape(t_scalar, (1,)).astype(buf_z.dtype)
+    return jnp.concatenate([t_feat, z_norm.reshape(-1)])     # (1 + q*d,)
+
+
+# ---- single-sample scan -----------------------------------------------
+
+def _build_gp_path_single(
+    t_scalar, x0_s, source_noise_s, path_noise_s, mask_s,
+    gp_q, gp_lengthscale, gp_kernel, gp_jitter, noise_scale, split_at,
+):
+    """Construct the GP path at a single timestep for a single batch sample.
+
+    This is the core differentiable function.  Applied via jax.jvp to get
+    dz/dt, then vmapped over the batch dimension.
+
+    Args:
+        t_scalar:       JAX scalar in [0, 1].
+        x0_s:           (L, d) clean embeddings.
+        source_noise_s: (L, d) source noise eps^i (i.i.d. N(0,I)).
+        path_noise_s:   (L, d) path innovation xi^i (i.i.d. N(0,I), independent of source).
+        mask_s:         (L,) conditioning mask (1 = conditioned token, kept at x0).
+        gp_q:           int — context window size.
+        gp_lengthscale: float — GP kernel length scale.
+        gp_kernel:      str — 'rbf' or 'exponential'.
+        gp_jitter:      float — GP posterior regularisation (added to K_ctx diagonal).
+        noise_scale:    float — noise scale σ (matches denoiser_noise_scale).
+        split_at:       int or None — segment boundary; if set, runs two independent scans.
+
+    Returns:
+        z_gp: (L, d) GP path at timestep t_scalar.
+
+    Algorithm (per token i):
+        m_i  = t * x_i + (1-t) * eps_i * σ          (linear mean)
+        f_i  = [t, unit_norm(z_{i-q}), ..., unit_norm(z_{i-1})]
+        α_i  = (K_ctx + λI)^{-1} k_{cross}           (GP weights, scalar per context slot)
+        σ_i  = sqrt(k(f_i,f_i) - k_cross^T α_i)      (posterior std, scalar)
+        r_i  = α_i @ buf_residual + s(t) * σ_i * xi_i (residual, applied to all d dims)
+        z_i  = mask_i * x_i + (1 - mask_i) * (m_i + r_i)
+
+    Token 0 (no context): σ_eff = 0, r_0 = 0 → z_0 = m_0 (exact linear path).
+    """
+    L, d = x0_s.shape
+    F = 1 + gp_q * d
+
+    eye_q = jnp.eye(gp_q, dtype=x0_s.dtype)
+
+    def scan_step(carry, inputs):
+        buf_z, buf_residual, buf_features, step_idx = carry
+        x_i, eps_i, xi_i, mask_i, t_i = inputs  # t_i same scalar for all positions
+
+        # Number of active context tokens for this position
+        c = jnp.minimum(step_idx, jnp.int32(gp_q))
+        active = jnp.arange(gp_q) >= (gp_q - c)  # (q,) bool, right-aligned
+
+        # Linear path mean
+        m_i = (1.0 - t_i) * eps_i * noise_scale + t_i * x_i  # (d,)
+
+        # Context feature for current token i
+        f_i = _path_context_feature_single(buf_z, t_i, active, gp_q)  # (F,)
+
+        # ---- GP posterior (scalar, applied uniformly to all d dims) ----
+
+        # Cross-kernel: k(f_i, f_j) for each stored context position j
+        k_cross = jax.vmap(
+            lambda fj: _path_kernel_fn(f_i, fj, gp_lengthscale, gp_kernel)
+        )(buf_features)  # (q,)
+        k_cross = k_cross * active.astype(k_cross.dtype)  # zero inactive
+
+        # Context kernel matrix: K[j,k] = k(f_j, f_k)
+        K_ctx = jax.vmap(
+            lambda fj: jax.vmap(
+                lambda fk: _path_kernel_fn(fj, fk, gp_lengthscale, gp_kernel)
+            )(buf_features)
+        )(buf_features)  # (q, q)
+
+        # Replace inactive rows/cols with identity (no contribution to solve)
+        act2d = (active[:, None] * active[None, :]).astype(K_ctx.dtype)  # (q, q)
+        K_ctx = K_ctx * act2d + eye_q * (1.0 - act2d)
+        K_ctx = K_ctx + gp_jitter * eye_q  # regularise
+
+        # alpha: (q,) scalar GP weights — same for all d embedding dims
+        alpha = jnp.linalg.solve(K_ctx, k_cross)  # (q,)
+
+        # Posterior variance
+        prior_var = _path_kernel_fn(f_i, f_i, gp_lengthscale, gp_kernel)  # ~1.0
+        var = prior_var - jnp.dot(k_cross, alpha)
+        sigma = jnp.sqrt(jnp.maximum(var, 1e-8))  # scalar
+
+        # Bridge scale: s(t) = 4t(1-t)
+        s_t = _bridge_scale(t_i)
+
+        # For the first token (c=0): no context → exact linear path.
+        # Force sigma_eff = 0 and mu_residual = 0.
+        has_context = (c > 0).astype(m_i.dtype)  # 0.0 for token 0, 1.0 otherwise
+        sigma_eff = sigma * has_context  # scalar
+
+        # Posterior mean residual: alpha @ buf_residual (same weights for all dims)
+        mu_residual = jnp.einsum('q,qd->d', alpha, buf_residual) * has_context  # (d,)
+
+        # z_i = m_i + residual
+        residual_i = mu_residual + s_t * sigma_eff * xi_i  # (d,)
+        z_i_uncond = m_i + residual_i
+
+        # Apply conditioning mask: conditioned tokens stay at x_i
+        z_i = mask_i * x_i + (1.0 - mask_i) * z_i_uncond  # (d,)
+
+        # Residual for buffer (includes conditioning effect)
+        residual_for_buf = z_i - m_i  # (d,)
+
+        # Update sliding buffers
+        new_buf_z = jnp.concatenate([buf_z[1:], z_i[None]], axis=0)
+        new_buf_residual = jnp.concatenate([buf_residual[1:], residual_for_buf[None]], axis=0)
+        new_buf_features = jnp.concatenate([buf_features[1:], f_i[None]], axis=0)
+        new_carry = (new_buf_z, new_buf_residual, new_buf_features, step_idx + 1)
+        return new_carry, z_i
+
+    # Repeat t_scalar for all token positions so scan can receive it
+    t_arr = jnp.full((L,), t_scalar, dtype=x0_s.dtype)  # (L,)
+
+    init_carry = (
+        jnp.zeros((gp_q, d), dtype=x0_s.dtype),  # buf_z
+        jnp.zeros((gp_q, d), dtype=x0_s.dtype),  # buf_residual
+        jnp.zeros((gp_q, F), dtype=x0_s.dtype),  # buf_features
+        jnp.array(0, dtype=jnp.int32),             # step_idx
+    )
+
+    if split_at is None:
+        inputs_tuple = (x0_s, source_noise_s, path_noise_s, mask_s, t_arr)
+        _, z_T = jax.lax.scan(scan_step, init_carry, inputs_tuple)
+    else:
+        # Two independent GP scans with fresh buffers at the segment boundary
+        inputs_1 = (x0_s[:split_at], source_noise_s[:split_at],
+                    path_noise_s[:split_at], mask_s[:split_at], t_arr[:split_at])
+        inputs_2 = (x0_s[split_at:], source_noise_s[split_at:],
+                    path_noise_s[split_at:], mask_s[split_at:], t_arr[split_at:])
+        _, z_T1 = jax.lax.scan(scan_step, init_carry, inputs_1)
+        _, z_T2 = jax.lax.scan(scan_step, init_carry, inputs_2)
+        z_T = jnp.concatenate([z_T1, z_T2], axis=0)
+
+    return z_T  # (L, d)
+
+
+# ---- batched public API -----------------------------------------------
+
+def build_path_at_t(
+    x0, source_noise, path_noise, t,
+    gp_q, gp_lengthscale, gp_kernel='rbf', gp_jitter=1e-4,
+    noise_scale=1.0, cond_seq_mask=None, split_at=None,
+):
+    """Construct GP-correlated paths at timestep t (without velocity).
+
+    A pure function that builds z_gp for a batch at a specific t.
+    Differentiable with respect to t via jax.jvp (used internally by
+    sample_gp_path_correlation to compute v_gp = dz_gp/dt).
+
+    Args:
+        x0:            (B, L, d) clean embeddings.
+        source_noise:  (B, L, d) source noise eps^i — defines the linear mean.
+        path_noise:    (B, L, d) path innovation xi^i — independent of source_noise.
+        t:             (B,) timesteps in [0, 1] (one per sample).
+        gp_q:          int — context window size.
+        gp_lengthscale: float — GP kernel length scale l.
+        gp_kernel:     'rbf' or 'exponential'.
+        gp_jitter:     float — regularisation added to K_ctx diagonal.
+        noise_scale:   float — scales source noise in the linear mean (σ).
+        cond_seq_mask: Optional (B, L) or (B, L, 1) — 1 pins token to x0.
+        split_at:      Optional int — independent GP scan per segment.
+
+    Returns:
+        z_gp: (B, L, d) GP path at time t.
+    """
+    B, L, d = x0.shape
+
+    # Normalise cond mask to (B, L)
+    if cond_seq_mask is not None:
+        mask_bl = cond_seq_mask.reshape(B, L).astype(x0.dtype)  # (B, L)
+    else:
+        mask_bl = jnp.zeros((B, L), dtype=x0.dtype)
+
+    # Per-sample function (receives per-sample t scalar, (L,d) arrays)
+    def single_sample(t_s, x_s, eps_s, xi_s, mask_s):
+        return _build_gp_path_single(
+            t_s, x_s, eps_s, xi_s, mask_s,
+            gp_q, gp_lengthscale, gp_kernel, gp_jitter, noise_scale, split_at,
+        )
+
+    # vmap over batch dimension
+    z_gp = jax.vmap(single_sample)(t, x0, source_noise, path_noise, mask_bl)  # (B, L, d)
+    return z_gp
+
+
+def sample_gp_path_correlation(
+    x0, source_noise, path_noise, t,
+    gp_q, gp_rho, gp_kernel='rbf', gp_jitter=1e-4,
+    noise_scale=1.0, cond_seq_mask=None, split_at=None,
+):
+    """Construct the GP path-correlation path and velocity (Stage 2 training).
+
+    Unlike sample_gp_path (noise correlation), this variant models the GP
+    directly over z_t^i | t, z_t^{C_i}, and computes the exact time-derivative
+    v_gp = dz_gp/dt via forward-mode automatic differentiation (jax.jvp).
+
+    The GP conditions on the actual path values at the current timestep t,
+    making alpha_i(t) and sigma_i(t) time-dependent.  The bridge scale
+    s(t) = 4t(1-t) ensures exact endpoint boundary conditions:
+        z_gp^i(0) = eps^i * noise_scale
+        z_gp^i(1) = x^i
+
+    NOTE on gp_rho: in this function gp_rho is used as the kernel length
+    scale l, not as adjacent-token correlation.  The RBF kernel is
+    K(fa,fb) = exp(-‖fa-fb‖²/(2l²)); exponential is exp(-‖fa-fb‖/l).
+    Use gp_rho ≈ 1.0–3.0 as a starting point (tune to your dataset).
+
+    Args:
+        x0:            (B, L, d) clean embeddings.
+        source_noise:  (B, L, d) i.i.d. N(0,I) — source noise for linear mean.
+        path_noise:    (B, L, d) i.i.d. N(0,I) — GP innovation (independent).
+        t:             (B,) timesteps in [0, 1].
+        gp_q:          int — causal context window size.
+        gp_rho:        float — GP kernel length scale l (repurposed from noise correlation).
+        gp_kernel:     'rbf' or 'exponential'.
+        gp_jitter:     float — GP posterior regularisation.
+        noise_scale:   float — scales source noise in linear mean (= denoiser_noise_scale).
+        cond_seq_mask: Optional (B, L, 1) — 1 pins token to clean x0.
+        split_at:      Optional int — independent GP scan per segment.
+
+    Returns:
+        z_gp:   (B, L, d) GP path at time t.
+        v_gp:   (B, L, d) GP velocity = dz_gp/dt (via jax.jvp).
+        aux:    None (placeholder matching sample_gp_path's 3-tuple interface).
+    """
+    if gp_kernel not in ('rbf', 'exponential'):
+        raise ValueError(
+            f"sample_gp_path_correlation requires gp_kernel 'rbf' or 'exponential', "
+            f"got '{gp_kernel}'. (The existing 'content' kernel is only supported by "
+            f"sample_gp_noise_correlation / sample_gp_path.)"
+        )
+
+    B, L, d = x0.shape
+    gp_lengthscale = gp_rho  # gp_rho acts as kernel length scale here
+
+    if cond_seq_mask is not None:
+        mask_bl = cond_seq_mask.reshape(B, L).astype(x0.dtype)  # (B, L)
+    else:
+        mask_bl = jnp.zeros((B, L), dtype=x0.dtype)
+
+    def _z_single(t_s, x_s, eps_s, xi_s, mask_s):
+        """GP path for one sample at scalar timestep t_s."""
+        return _build_gp_path_single(
+            t_s, x_s, eps_s, xi_s, mask_s,
+            gp_q, gp_lengthscale, gp_kernel, gp_jitter, noise_scale, split_at,
+        )
+
+    def _z_and_v_single(t_s, x_s, eps_s, xi_s, mask_s):
+        """GP path + time-derivative for one sample via forward-mode AD."""
+        z, v = jax.jvp(
+            lambda t: _z_single(t, x_s, eps_s, xi_s, mask_s),
+            (t_s,),
+            (jnp.ones_like(t_s),),  # tangent = 1 → computes dz/dt
+        )
+        return z, v
+
+    # vmap over batch: each sample has its own t_s scalar
+    z_gp, v_gp = jax.vmap(_z_and_v_single)(
+        t, x0, source_noise, path_noise, mask_bl
+    )  # both (B, L, d)
+
+    return z_gp, v_gp, None
+
+
 # ============================================
 # Stage 2 — conditional velocity wrapper
 # ============================================
