@@ -198,15 +198,31 @@ Best config: `gp_rho=3.0`, `blr=1e-3`. All rho values (2/3/4) perform similarly 
 
 ### LM1B — Stage 1 (ELF-B, 104M params, trained from scratch)
 
-| Checkpoint | Steps | GEN.PPL (64-step SDE) | Entropy |
-|------------|-------|----------------------|---------|
-| epoch 1 (partial) | 50k | 61.9 | 2.36 |
-| epoch 2 | 287k | 117.9 | 3.98 |
-| epoch 3 | 523k | 101.7 | 4.00 |
-| epoch 4 | ~760k | in progress | — |
-| epoch 5 | ~996k | scheduled | — |
+| Checkpoint | Steps | GEN.PPL (32-step SDE) | GEN.PPL (64-step SDE) | Entropy (64-step) |
+|------------|-------|----------------------|-----------------------|-------------------|
+| epoch 1 (partial) | 50k | — | 61.9 | 2.36 |
+| epoch 2 | 287k | — | 117.9 | 3.98 |
+| epoch 3 | 523k | — | 101.7 | 4.00 |
+| epoch 5 | 996k | **130.5** | **95.3** | 4.03 |
 
-PPL trend: improving from epoch 2→3→... Entropy rising toward healthy range (~4).
+PPL steadily improves; entropy stabilizes ~4. Eval checkpoint: `outputs/corrflow_stage1-lm1b/checkpoint_996904`.
+
+### LM1B — CorrFlow vs FLM comparison
+
+FLM checkpoint: `david3684/FLM-B-LM1B` (HF), 30522 vocab, BERT tokenizer, 1M training steps.
+FLM eval repo: `/home.na1/ad.wsu.edu/khiem.tran/pvt/flm/`, env: `flm` conda env.
+Converted ckpt: `/home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/FLM-B-LM1B/lm1b_flm.ckpt`
+
+| Model | Steps | Gen.PPL | Entropy |
+|-------|-------|---------|---------|
+| FLM (paper) | 32 | 152.01 | 4.40 |
+| FLM (ours) | 32 | 154.34 | 4.41 |
+| **CorrFlow Stage 1** | **32** | **130.5** | **4.03** |
+| FLM (paper) | 64 | 126.51 | 4.36 |
+| FLM (ours) | 64 | 125.24 | 4.37 |
+| **CorrFlow Stage 1** | **64** | **95.3** | **3.98** |
+
+CorrFlow outperforms FLM by ~24 PPL at 32 steps and ~30 PPL at 64 steps. FLM paper numbers reproduced within 1.5%.
 
 ## Important implementation notes
 
