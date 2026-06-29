@@ -62,13 +62,8 @@ class Config:
 
     # GP path (Stage 2: correlation-aware path)
     gp_q: int = 2             # Context window size: token i conditions on the previous gp_q tokens
-    gp_rho: float = 0.5       # Noise correlation: adjacent-token correlation.
-                               # Path correlation: kernel length scale l (repurposed).
-    gp_kernel: str = 'rbf'    # Kernel: 'rbf' or 'exponential'.
-                               # Noise correlation only: 'content' (uses content-feature RBF, gp_rho as denominator).
-                               # Path correlation requires 'rbf' or 'exponential'.
-    gp_jitter: float = 1e-4   # GP posterior regularisation (path correlation only)
-    correlation_type: str = 'noise'  # 'noise': sample_gp_path (existing); 'path': sample_gp_path_correlation
+    gp_rho: float = 0.5       # Adjacent-token correlation (kernel denominator).
+    gp_kernel: str = 'rbf'    # Kernel: 'rbf', 'exponential', or 'content'.
 
     # CorrNetwork φ_η (Stage 2: correlation network)
     corr_model: str = 'CorrNet-M'  # Size variant: CorrNet-S (h=128), CorrNet-M (h=256), CorrNet-L (h=512)
