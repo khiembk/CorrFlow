@@ -732,10 +732,9 @@ def sample_gp_path_correlation(x0, source_noise, t, gp_q, gp_lengthscale, gp_pat
                                 split_at=None):
     """Compute GP-correlated path and exact dz/dt velocity via jax.jvp.
 
-    t must be scalar (shared across the batch) so that the jvp is well-defined.
-
-    Args:
-        (same as build_gp_path_correlation_at_t, with scalar t)
+    Supports both scalar t (shared across batch) and per-example t of shape (B,).
+    When t is (B,), batch elements are independent so JVP with all-ones tangent
+    yields the correct per-example dz^b/dt^b (cross-batch Jacobian terms are zero).
 
     Returns:
         z_path: (B, L, d)
@@ -743,16 +742,28 @@ def sample_gp_path_correlation(x0, source_noise, t, gp_q, gp_lengthscale, gp_pat
         aux:    dict (empty; reserved)
     """
     B = x0.shape[0]
+    t_arr = jnp.asarray(t, dtype=x0.dtype)
 
-    def path_fn(t_scalar):
-        t_vec = jnp.broadcast_to(t_scalar, (B,))
-        z, _ = build_gp_path_correlation_at_t(
-            x0, source_noise, t_vec, gp_q, gp_lengthscale, gp_path_strength,
-            gp_kernel, gp_jitter, cond_seq_mask, split_at,
-        )
-        return z
-
-    t_scalar = jnp.reshape(jnp.asarray(t, dtype=x0.dtype), ())
-    z_path, v_path = jax.jvp(path_fn, (t_scalar,), (jnp.ones_like(t_scalar),))
+    if t_arr.ndim == 0:
+        # Scalar t: differentiate w.r.t. single shared t.
+        def path_fn(t_scalar):
+            t_vec = jnp.broadcast_to(t_scalar, (B,))
+            z, _ = build_gp_path_correlation_at_t(
+                x0, source_noise, t_vec, gp_q, gp_lengthscale, gp_path_strength,
+                gp_kernel, gp_jitter, cond_seq_mask, split_at,
+            )
+            return z
+        z_path, v_path = jax.jvp(path_fn, (t_arr,), (jnp.ones_like(t_arr),))
+    else:
+        # Per-example t: (B,). Batch elements are independent so the JVP with
+        # tangent = ones_B gives diag(J) = [dz^b/dt^b], the per-example velocities.
+        t_vec = t_arr.reshape(B)
+        def path_fn(t_vec_):
+            z, _ = build_gp_path_correlation_at_t(
+                x0, source_noise, t_vec_, gp_q, gp_lengthscale, gp_path_strength,
+                gp_kernel, gp_jitter, cond_seq_mask, split_at,
+            )
+            return z
+        z_path, v_path = jax.jvp(path_fn, (t_vec,), (jnp.ones_like(t_vec),))
 
     return z_path, v_path, {}

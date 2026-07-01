@@ -62,8 +62,12 @@ class Config:
 
     # GP path (Stage 2: correlation-aware path)
     gp_q: int = 2             # Context window size: token i conditions on the previous gp_q tokens
-    gp_rho: float = 0.5       # Adjacent-token correlation (kernel denominator).
+    gp_rho: float = 0.5       # Adjacent-token correlation (noise-GP kernel denominator).
     gp_kernel: str = 'rbf'    # Kernel: 'rbf', 'exponential', or 'content'.
+    # Path-GP fields (use_path_gp=True switches from noise-GP to deterministic path-GP)
+    use_path_gp: bool = False
+    gp_path_strength: float = 1.0   # Blend strength γ (λ = γ·4t(1-t)·c_i)
+    gp_lengthscale: float = 1.0     # Kernel length scale ℓ for path-GP
 
     # CorrNetwork φ_η (Stage 2: correlation network)
     corr_model: str = 'CorrNet-M'  # Size variant: CorrNet-S (h=128), CorrNet-M (h=256), CorrNet-L (h=512)

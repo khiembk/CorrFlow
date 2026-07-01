@@ -26,7 +26,7 @@ import jax.numpy as jnp
 from utils.train_utils import TrainState
 from utils.encoder_utils import encode_text
 from utils.sampling_utils import (
-    sample_timesteps, sample_gp_path, net_out_to_v_x,
+    sample_timesteps, sample_gp_path, sample_gp_path_correlation, net_out_to_v_x,
 )
 
 
@@ -98,15 +98,26 @@ def train_step_stage2(
 
     noise = jax.random.normal(noise_rng, x0.shape, dtype=x0.dtype)  # (B, L, d)
 
-    z_gp, v_gp, _ = sample_gp_path(
-        x0, noise, t,
-        gp_q=config.gp_q,
-        gp_rho=config.gp_rho,
-        gp_kernel=config.gp_kernel,
-        noise_scale=config.denoiser_noise_scale,
-        cond_seq_mask=cond_seq_mask,
-        split_at=getattr(config, 'max_input_length', None),
-    )  # z_gp: (B, L, d), v_gp: (B, L, d)
+    if getattr(config, 'use_path_gp', False):
+        z_gp, v_gp, _ = sample_gp_path_correlation(
+            x0, noise, t,
+            gp_q=config.gp_q,
+            gp_lengthscale=config.gp_lengthscale,
+            gp_path_strength=config.gp_path_strength,
+            gp_kernel=config.gp_kernel,
+            cond_seq_mask=cond_seq_mask,
+            split_at=getattr(config, 'max_input_length', None),
+        )
+    else:
+        z_gp, v_gp, _ = sample_gp_path(
+            x0, noise, t,
+            gp_q=config.gp_q,
+            gp_rho=config.gp_rho,
+            gp_kernel=config.gp_kernel,
+            noise_scale=config.denoiser_noise_scale,
+            cond_seq_mask=cond_seq_mask,
+            split_at=getattr(config, 'max_input_length', None),
+        )  # z_gp: (B, L, d), v_gp: (B, L, d)
 
     # ------------------------------------------------------------------ backbone input
     # Run the frozen backbone without self-conditioning: zero out the self-cond slot.
