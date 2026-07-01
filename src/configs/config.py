@@ -66,8 +66,10 @@ class Config:
     gp_kernel: str = 'rbf'    # Kernel: 'rbf', 'exponential', or 'content'.
     # Path-GP fields (use_path_gp=True switches from noise-GP to deterministic path-GP)
     use_path_gp: bool = False
-    gp_path_strength: float = 1.0   # Blend strength γ (λ = γ·4t(1-t)·c_i)
+    gp_path_strength: float = 1.0   # Blend strength γ ∈ [0, 1]
     gp_lengthscale: float = 1.0     # Kernel length scale ℓ for path-GP
+    gp_obs_noise: float = 0.01      # GP observation noise (ridge on active diagonal)
+    gp_jitter: float = 1e-5         # Numerical jitter (all diagonal entries)
 
     # CorrNetwork φ_η (Stage 2: correlation network)
     corr_model: str = 'CorrNet-M'  # Size variant: CorrNet-S (h=128), CorrNet-M (h=256), CorrNet-L (h=512)

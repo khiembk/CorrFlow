@@ -3,6 +3,7 @@ from functools import partial
 import numpy as np
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
 from jax import Array
 
 
@@ -536,13 +537,47 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
 # ============================================
 
 def _normalize_vec(v, eps=1e-8):
-    """L2-normalize v along the last axis.
-
-    Uses sqrt(||v||^2 + eps^2) so the JVP is well-defined at v=0 (avoids 0/0).
-    """
+    """L2-normalize along last axis; sqrt(||v||²+eps²) avoids 0/0 at v=0."""
     return v / jnp.sqrt(jnp.sum(v ** 2, axis=-1, keepdims=True) + eps ** 2)
 
 
+def make_static_gp_feature(source_i, target_i, source_context, target_context,
+                            active_mask, normalization_eps=1e-8):
+    """Static (time-independent) GP feature for token i.
+
+    Concatenates [ν(ε^i), ν(x^i), active_mask, ν(ε_ctx_flat), ν(x_ctx_flat)]
+    giving shape (B, 2d + q + 2qd). No t, no z_t → dα/dt = 0.
+
+    Args:
+        source_i:        (B, d) source noise ε^i
+        target_i:        (B, d) target embedding x^i
+        source_context:  (B, q, d) source noise of context tokens
+        target_context:  (B, q, d) target embeddings of context tokens
+        active_mask:     (B, q) float mask (1=valid, 0=padding)
+        normalization_eps: epsilon for safe L2-norm
+
+    Returns:
+        feature: (B, 2d + q + 2qd)
+    """
+    B, d = source_i.shape
+    q = source_context.shape[1]
+
+    def nu(v):
+        return _normalize_vec(v, normalization_eps)
+
+    nu_src_ctx = nu(source_context.reshape(B * q, d)).reshape(B, q * d)
+    nu_tgt_ctx = nu(target_context.reshape(B * q, d)).reshape(B, q * d)
+
+    return jnp.concatenate([
+        nu(source_i),   # (B, d)
+        nu(target_i),   # (B, d)
+        active_mask,    # (B, q)
+        nu_src_ctx,     # (B, qd)
+        nu_tgt_ctx,     # (B, qd)
+    ], axis=-1)         # (B, 2d + q + 2qd)
+
+
+# Keep old name as alias for backward compat with any callers
 def make_gp_context_feature(source_i, target_i, linear_i, buf_z, t, active_mask,
                              normalization_eps=1e-8):
     """Build the context feature vector for token i.
@@ -586,184 +621,253 @@ def make_gp_context_feature(source_i, target_i, linear_i, buf_z, t, active_mask,
     ], axis=-1)         # (B, 1+3d+q+qd)
 
 
-def gp_kernel_fn(feature_a, feature_b, kernel_type="rbf", lengthscale=1.0):
-    """Pairwise kernel between feature vectors.
+def gp_kernel_fn(feature_a, feature_b, kernel_type="rbf", lengthscale=1.0, eps=1e-8):
+    """Pairwise kernel using mean-squared distance (normalized by feature dim D_h).
+
+    D_ms = sum(diff²) / D_h — scale-invariant; prevents kernel collapse at high d.
 
     Args:
-        feature_a:   (*, F) batch + feature dims
+        feature_a:   (*, F) features (cast to float32 internally)
         feature_b:   (*, F) same shape
-        kernel_type: 'rbf'  → exp(-‖·‖²/2ℓ²)
-                     'exponential' → exp(-‖·‖/ℓ)
+        kernel_type: 'rbf'         → exp(-D_ms / 2ℓ²)
+                     'exponential' → exp(-sqrt(D_ms + eps) / ℓ)
         lengthscale: scalar ℓ
+        eps:         float for exponential stability
 
     Returns:
         k: (*,) kernel values in (0, 1]
     """
-    diff = feature_a - feature_b
+    a = jnp.asarray(feature_a, dtype=jnp.float32)
+    b = jnp.asarray(feature_b, dtype=jnp.float32)
+    diff = a - b
+    D_h = max(diff.shape[-1], 1)
+    D_ms = jnp.sum(diff ** 2, axis=-1) / D_h
     ell = float(lengthscale)
     if kernel_type == "rbf":
-        return jnp.exp(-jnp.sum(diff ** 2, axis=-1) / (2.0 * ell ** 2))
+        return jnp.exp(-D_ms / (2.0 * ell ** 2))
     elif kernel_type == "exponential":
-        return jnp.exp(-jnp.sqrt(jnp.sum(diff ** 2, axis=-1) + 1e-12) / ell)
+        return jnp.exp(-jnp.sqrt(D_ms + 1e-12) / ell)
     else:
         raise ValueError(f"Unknown kernel_type '{kernel_type}'. Use 'rbf' or 'exponential'.")
 
 
-def build_gp_path_correlation_at_t(x0, source_noise, t, gp_q, gp_lengthscale,
-                                    gp_path_strength, gp_kernel="rbf", gp_jitter=1e-5,
-                                    cond_seq_mask=None, split_at=None):
-    """Build GP-correlated z_t paths at a fixed time t via causal lax.scan.
+def gp_bridge(t):
+    """Bridge function b(t) = 16t²(1-t)²; b(0)=b(1)=0 and b'(0)=b'(1)=0."""
+    return 16.0 * t ** 2 * (1.0 - t) ** 2
 
-    For each token i (left-to-right):
-        m_i(t)  = t·x^i + (1−t)·ε^i·σ            (linear midpoint, σ=2)
-        z̄_t^i  = GP posterior mean over buf_z      (normalized-path RBF/exp kernel)
-        c_i     = |active_context| / gp_q          (ramps 0→1 as buffer fills)
-        λ_i(t)  = γ · 4t(1−t) · c_i              (bridge: 0 at t∈{0,1})
-        z_t^i   = m_i(t) + λ_i(t)·(z̄_t^i − m_i(t))
 
-    Context buffer (slot 0 = most recent, slot q-1 = oldest).
-    Endpoint preservation: λ_i(0)=λ_i(1)=0, so z_t^i(0)=ε^i·σ, z_t^i(1)=x^i exactly.
+def gp_bridge_derivative(t):
+    """Derivative b'(t) = 32t(1-t)(1-2t)."""
+    return 32.0 * t * (1.0 - t) * (1.0 - 2.0 * t)
+
+
+def sample_gp_path_correlation(
+    x0, source_noise, t, gp_q, gp_lengthscale, gp_path_strength,
+    gp_kernel="rbf", gp_obs_noise=1e-2, gp_jitter=1e-5,
+    cond_seq_mask=None, split_at=None,
+):
+    """Exact analytic GP path and velocity. No jax.jvp. No stop_gradient.
+
+    For each token i (left-to-right), static features f_j = [ν(ε^j), ν(x^j)] (2d):
+        K_mat[b,j,k] = kernel(f_ctx_j, f_ctx_k) + diag(obs_noise·active + jitter)
+        K_vec[b,j]   = kernel(f_i, f_ctx_j) · active_j
+        [alpha_z, alpha_v, alpha_k] = K_mat^{-1} @ [z_ctx, v_ctx, K_vec]  (Cholesky)
+        z̄_i  = K_vec^T @ alpha_z              (GP posterior mean over z)
+        v̄_i  = K_vec^T @ alpha_v              (GP posterior mean over v)
+        β_i   = γ · b(t) · c_i,   c_i = n_active/q,   b(t) = 16t²(1-t)²
+        z_i   = m_i + β_i · (z̄_i − m_i)
+        v_i   = v_lin,i + β'_i·(z̄_i − m_i) + β_i·(v̄_i − v_lin,i)    [exact, no sg]
+
+    Kernel features are time-independent → dα/dt = 0 → stable exact velocity.
 
     Args:
-        x0:               (B, L, d) target embeddings
-        source_noise:     (B, L, d) un-scaled source noise ε
-        t:                scalar or (B,) time in [0, 1]
-        gp_q:             int causal context window size
-        gp_lengthscale:   float kernel length scale ℓ
-        gp_path_strength: float blend strength γ
-        gp_kernel:        'rbf' or 'exponential'
-        gp_jitter:        float diagonal jitter for GP stability
-        cond_seq_mask:    (B, L, 1) optional; 1=keep x0, 0=generate
-        split_at:         int optional GP buffer reset position (for src/tgt boundary)
+        x0:              (B, L, d) target embeddings
+        source_noise:    (B, L, d) unscaled source noise ε
+        t:               scalar or (B,) time in [0, 1]
+        gp_q:            int causal context window size
+        gp_lengthscale:  float kernel length scale ℓ
+        gp_path_strength: float blend strength γ ∈ [0, 1]
+        gp_kernel:       'rbf' or 'exponential'
+        gp_obs_noise:    float GP observation noise added to active diagonal
+        gp_jitter:       float jitter added to all diagonal entries
+        cond_seq_mask:   (B, L, 1) optional; 1=keep x0 exactly, 0=generate
+        split_at:        int optional GP buffer reset (src/tgt boundary)
 
     Returns:
-        z_path: (B, L, d) GP-correlated z_t
-        aux:    dict (empty; reserved)
+        z_path: (B, L, d)  GP-correlated latent at time t
+        v_path: (B, L, d)  exact analytic velocity (dz/dt)
+        aux:    dict with diagnostics
     """
+    sigma = 2.0
     B, L, d = x0.shape
-    sigma = 2.0  # must match denoiser_noise_scale
+    work_dtype = x0.dtype
+    feat_dim = 2 * d  # per-token static feature: [ν(ε), ν(x)]
 
-    t_arr = jnp.asarray(t, dtype=x0.dtype)
+    t_arr = jnp.asarray(t, dtype=jnp.float32)
     if t_arr.ndim == 0:
         t_b = jnp.broadcast_to(t_arr, (B,))
     else:
         t_b = t_arr.reshape(B)
 
-    x0_T    = x0.transpose(1, 0, 2)       # (L, B, d)
-    noise_T = source_noise.transpose(1, 0, 2)
+    x0_T    = x0.transpose(1, 0, 2)           # (L, B, d)
+    noise_T = source_noise.transpose(1, 0, 2)  # (L, B, d)
 
-    init_buf_z = jnp.zeros((B, gp_q, d), dtype=x0.dtype)
-    init_carry = (init_buf_z, jnp.zeros((), dtype=jnp.int32))
+    def _token_feat(src, tgt):
+        """Static per-token feature [ν(ε), ν(x)] in float32, shape (B, 2d)."""
+        return jnp.concatenate([
+            _normalize_vec(jnp.asarray(src, jnp.float32)),
+            _normalize_vec(jnp.asarray(tgt, jnp.float32)),
+        ], axis=-1)
+
+    def _fwd(l, r):
+        return jsp_linalg.solve_triangular(l, r, lower=True)
+
+    def _bwd(lt, r):
+        return jsp_linalg.solve_triangular(lt, r, lower=False)
 
     def step_fn(carry, xs):
-        buf_z, step_idx = carry           # (B, gp_q, d), scalar int32
-        noise_i, x0_i = xs               # (B, d) each
+        src_ctx, tgt_ctx, feat_ctx, z_ctx, v_ctx, step_idx = carry
+        # src_ctx, tgt_ctx: (B, q, d); feat_ctx: (B, q, 2d); z_ctx, v_ctx: (B, q, d)
+        noise_i, x0_i = xs  # (B, d) each
 
-        linear_i = t_b[:, None] * x0_i + (1.0 - t_b[:, None]) * noise_i * sigma  # (B, d)
+        t_e     = t_b.astype(work_dtype)[:, None]         # (B, 1)
+        m_i     = t_e * x0_i + (1.0 - t_e) * noise_i * sigma  # (B, d)
+        v_lin_i = x0_i - noise_i * sigma                        # (B, d)
 
-        # Slot j is active if j < step_idx (slot 0 = most recent filled entry)
-        active_mask   = (jnp.arange(gp_q) < step_idx).astype(x0.dtype)  # (gp_q,)
-        active_mask_B = jnp.broadcast_to(active_mask[None], (B, gp_q))   # (B, gp_q)
-        n_active      = jnp.sum(active_mask)                              # scalar
+        f_i = _token_feat(noise_i, x0_i)  # (B, 2d) float32
 
-        # Normalized keys for kernel computation
-        query_key = _normalize_vec(linear_i)                                          # (B, d)
-        ctx_keys  = _normalize_vec(buf_z.reshape(B * gp_q, d)).reshape(B, gp_q, d)   # (B, gp_q, d)
+        # Active mask: slot j active if j < step_idx
+        active_mask = (jnp.arange(gp_q) < step_idx).astype(jnp.float32)  # (q,)
+        n_active    = jnp.sum(active_mask)
 
-        # K_vec[b, j] = K(query_key[b], ctx_keys[b, j])
-        diff_qc = query_key[:, None, :] - ctx_keys   # (B, gp_q, d)
+        # --- kernel matrices (float32) ---
+        fc = feat_ctx  # (B, q, 2d) float32
+
+        # K_vec[b,j] = kernel(f_i[b], fc[b,j]) * active[j]
+        diff_qc = f_i[:, None, :] - fc          # (B, q, 2d)
+        D_ms_qc = jnp.sum(diff_qc ** 2, axis=-1) / feat_dim   # (B, q)
         if gp_kernel == "rbf":
-            K_vec = jnp.exp(
-                -jnp.sum(diff_qc ** 2, axis=-1) / (2.0 * gp_lengthscale ** 2)
-            )
-        else:  # exponential
-            K_vec = jnp.exp(
-                -jnp.sqrt(jnp.sum(diff_qc ** 2, axis=-1) + 1e-12) / gp_lengthscale
-            )
-        K_vec = K_vec * active_mask_B  # zero-out inactive slots  (B, gp_q)
-
-        # K_mat[b, j, k] = K(ctx_keys[b, j], ctx_keys[b, k])
-        diff_cc = ctx_keys[:, :, None, :] - ctx_keys[:, None, :, :]   # (B, gp_q, gp_q, d)
-        if gp_kernel == "rbf":
-            K_mat = jnp.exp(
-                -jnp.sum(diff_cc ** 2, axis=-1) / (2.0 * gp_lengthscale ** 2)
-            )
+            K_vec = jnp.exp(-D_ms_qc / (2.0 * gp_lengthscale ** 2))
         else:
-            K_mat = jnp.exp(
-                -jnp.sqrt(jnp.sum(diff_cc ** 2, axis=-1) + 1e-12) / gp_lengthscale
-            )
-        I_active = active_mask[:, None] * active_mask[None, :]           # (gp_q, gp_q)
-        K_mat = K_mat * I_active[None] + jnp.eye(gp_q)[None] * gp_jitter  # (B, gp_q, gp_q)
+            K_vec = jnp.exp(-jnp.sqrt(D_ms_qc + 1e-8) / gp_lengthscale)
+        K_vec = K_vec * active_mask[None, :]    # (B, q)
 
-        # GP solve: alpha = K_mat^{-1} · buf_z  →  z̄_i = K_vec^T · alpha
-        alpha   = jnp.linalg.solve(K_mat, buf_z)           # (B, gp_q, d)
-        z_bar_i = jnp.einsum("bq,bqd->bd", K_vec, alpha)   # (B, d)
+        # K_mat[b,j,k] = kernel(fc[b,j], fc[b,k])
+        diff_cc = fc[:, :, None, :] - fc[:, None, :, :]         # (B, q, q, 2d)
+        D_ms_cc = jnp.sum(diff_cc ** 2, axis=-1) / feat_dim      # (B, q, q)
+        if gp_kernel == "rbf":
+            K_mat = jnp.exp(-D_ms_cc / (2.0 * gp_lengthscale ** 2))
+        else:
+            K_mat = jnp.exp(-jnp.sqrt(D_ms_cc + 1e-8) / gp_lengthscale)
 
-        # Endpoint-preserving blend
-        c_i   = n_active / gp_q                                              # [0, 1]
-        lam_i = (gp_path_strength * 4.0 * t_b * (1.0 - t_b) * c_i)[:, None]  # (B, 1)
-        z_i   = linear_i + lam_i * (z_bar_i - linear_i)                     # (B, d)
+        # Mask inactive pairs and regularize
+        I_active = active_mask[:, None] * active_mask[None, :]  # (q, q)
+        diag_reg = jnp.diag(active_mask * gp_obs_noise + jnp.ones(gp_q) * gp_jitter)
+        K_mat    = K_mat * I_active[None] + diag_reg[None]       # (B, q, q)
 
-        # Update ring buffer: prepend newest, discard oldest
-        new_buf_z = jnp.concatenate([z_i[:, None, :], buf_z[:, :-1, :]], axis=1)
-        return (new_buf_z, step_idx + 1), z_i
+        # --- Cholesky solve: K_mat @ [alpha_z, alpha_v, alpha_k] = [z_ctx, v_ctx, K_vec] ---
+        z_ctx_f32  = z_ctx.astype(jnp.float32)   # (B, q, d)
+        v_ctx_f32  = v_ctx.astype(jnp.float32)   # (B, q, d)
+        K_vec_col  = K_vec[..., None]             # (B, q, 1)
+        rhs = jnp.concatenate([z_ctx_f32, v_ctx_f32, K_vec_col], axis=-1)  # (B, q, 2d+1)
 
-    def _scan(xs_pair):
-        _, z_T = jax.lax.scan(step_fn, init_carry, xs_pair)
-        return z_T
+        L_chol = jnp.linalg.cholesky(K_mat)                          # (B, q, q)
+        y      = jax.vmap(_fwd)(L_chol, rhs)                         # (B, q, 2d+1)
+        alpha  = jax.vmap(_bwd)(L_chol, y)                           # (B, q, 2d+1)
+
+        alpha_z = alpha[..., :d].astype(work_dtype)   # (B, q, d)
+        alpha_v = alpha[..., d:2*d].astype(work_dtype) # (B, q, d)
+        alpha_k = alpha[..., 2*d]                      # (B, q) float32
+
+        # --- GP posterior means ---
+        K_vec_w = K_vec.astype(work_dtype)
+        z_bar_i = jnp.einsum("bq,bqd->bd", K_vec_w, alpha_z)  # (B, d)
+        v_bar_i = jnp.einsum("bq,bqd->bd", K_vec_w, alpha_v)  # (B, d)
+
+        # --- Bridge factors ---
+        t_s   = t_b                                                              # (B,) float32
+        b_t   = gp_bridge(t_s).astype(work_dtype)[:, None]                      # (B, 1)
+        db_t  = gp_bridge_derivative(t_s).astype(work_dtype)[:, None]           # (B, 1)
+        c_i   = (n_active / gp_q).astype(work_dtype)
+        beta  = gp_path_strength * b_t * c_i    # (B, 1)
+        dbeta = gp_path_strength * db_t * c_i   # (B, 1)
+
+        # --- Exact analytic path and velocity ---
+        delta_z = z_bar_i - m_i                                   # (B, d)
+        z_i = m_i + beta * delta_z                                 # (B, d)
+        v_i = v_lin_i + dbeta * delta_z + beta * (v_bar_i - v_lin_i)  # (B, d)
+
+        # --- Diagnostics ---
+        post_var_i = jnp.maximum(
+            1.0 - jnp.einsum("bq,bq->b", K_vec, alpha_k), 0.0
+        ).astype(work_dtype)  # (B,)
+        L_diag_min_i = jnp.min(
+            jnp.diagonal(L_chol, axis1=-2, axis2=-1), axis=-1
+        ).astype(work_dtype)  # (B,)
+
+        # --- Update carry ---
+        new_src_ctx  = jnp.concatenate([noise_i[:, None, :], src_ctx[:, :-1, :]], axis=1)
+        new_tgt_ctx  = jnp.concatenate([x0_i[:, None, :], tgt_ctx[:, :-1, :]], axis=1)
+        new_feat_ctx = jnp.concatenate([f_i[:, None, :], feat_ctx[:, :-1, :]], axis=1)
+        new_z_ctx    = jnp.concatenate([z_i[:, None, :], z_ctx[:, :-1, :]], axis=1)
+        new_v_ctx    = jnp.concatenate([v_i[:, None, :], v_ctx[:, :-1, :]], axis=1)
+
+        new_carry = (new_src_ctx, new_tgt_ctx, new_feat_ctx, new_z_ctx, new_v_ctx,
+                     step_idx + 1)
+        outs = (z_i, v_i, m_i, z_bar_i, v_bar_i,
+                beta[:, 0], dbeta[:, 0], post_var_i, L_diag_min_i)
+        return new_carry, outs
+
+    def _run_scan(xs_pair):
+        init_carry = (
+            jnp.zeros((B, gp_q, d),        dtype=work_dtype),  # src_ctx
+            jnp.zeros((B, gp_q, d),        dtype=work_dtype),  # tgt_ctx
+            jnp.zeros((B, gp_q, feat_dim), dtype=jnp.float32), # feat_ctx
+            jnp.zeros((B, gp_q, d),        dtype=work_dtype),  # z_ctx
+            jnp.zeros((B, gp_q, d),        dtype=work_dtype),  # v_ctx
+            jnp.zeros((),                  dtype=jnp.int32),   # step_idx
+        )
+        _, outs = jax.lax.scan(step_fn, init_carry, xs_pair)
+        return outs  # each: (S, B, ...)
 
     if split_at is not None:
-        z_src_T = _scan((noise_T[:split_at], x0_T[:split_at]))
-        z_tgt_T = _scan((noise_T[split_at:], x0_T[split_at:]))
-        z_path_T = jnp.concatenate([z_src_T, z_tgt_T], axis=0)
+        outs_src = _run_scan((noise_T[:split_at], x0_T[:split_at]))
+        outs_tgt = _run_scan((noise_T[split_at:], x0_T[split_at:]))
+        outs = jax.tree_util.tree_map(
+            lambda a, b: jnp.concatenate([a, b], axis=0), outs_src, outs_tgt,
+        )
     else:
-        z_path_T = _scan((noise_T, x0_T))
+        outs = _run_scan((noise_T, x0_T))
 
-    z_path = z_path_T.transpose(1, 0, 2)  # (B, L, d)
+    z_T, v_T, m_T, zbar_T, vbar_T, beta_T, dbeta_T, pvar_T, ldiag_T = outs
+
+    def _tr(a):
+        return a.transpose(1, 0, 2) if a.ndim == 3 else a.T
+
+    z_path = _tr(z_T)     # (B, L, d)
+    v_path = _tr(v_T)     # (B, L, d)
+    m_path = _tr(m_T)     # (B, L, d)
+    z_bar  = _tr(zbar_T)  # (B, L, d)
+    v_bar  = _tr(vbar_T)  # (B, L, d)
+    beta   = beta_T.T     # (B, L)
+    dbeta  = dbeta_T.T    # (B, L)
+    pvar   = pvar_T.T     # (B, L)
+    ldiag  = ldiag_T.T    # (B, L)
 
     if cond_seq_mask is not None:
+        v_lin_all = x0 - source_noise * sigma
         z_path = cond_seq_mask * x0 + (1.0 - cond_seq_mask) * z_path
+        v_path = cond_seq_mask * v_lin_all + (1.0 - cond_seq_mask) * v_path
 
-    return z_path, {}
-
-
-def sample_gp_path_correlation(x0, source_noise, t, gp_q, gp_lengthscale, gp_path_strength,
-                                gp_kernel="rbf", gp_jitter=1e-5, cond_seq_mask=None,
-                                split_at=None):
-    """Compute GP-correlated path and exact dz/dt velocity via jax.jvp.
-
-    Supports both scalar t (shared across batch) and per-example t of shape (B,).
-    When t is (B,), batch elements are independent so JVP with all-ones tangent
-    yields the correct per-example dz^b/dt^b (cross-batch Jacobian terms are zero).
-
-    Returns:
-        z_path: (B, L, d)
-        v_path: (B, L, d) exact dz/dt via forward-mode AD
-        aux:    dict (empty; reserved)
-    """
-    B = x0.shape[0]
-    t_arr = jnp.asarray(t, dtype=x0.dtype)
-
-    if t_arr.ndim == 0:
-        # Scalar t: differentiate w.r.t. single shared t.
-        def path_fn(t_scalar):
-            t_vec = jnp.broadcast_to(t_scalar, (B,))
-            z, _ = build_gp_path_correlation_at_t(
-                x0, source_noise, t_vec, gp_q, gp_lengthscale, gp_path_strength,
-                gp_kernel, gp_jitter, cond_seq_mask, split_at,
-            )
-            return z
-        z_path, v_path = jax.jvp(path_fn, (t_arr,), (jnp.ones_like(t_arr),))
-    else:
-        # Per-example t: (B,). Batch elements are independent so the JVP with
-        # tangent = ones_B gives diag(J) = [dz^b/dt^b], the per-example velocities.
-        t_vec = t_arr.reshape(B)
-        def path_fn(t_vec_):
-            z, _ = build_gp_path_correlation_at_t(
-                x0, source_noise, t_vec_, gp_q, gp_lengthscale, gp_path_strength,
-                gp_kernel, gp_jitter, cond_seq_mask, split_at,
-            )
-            return z
-        z_path, v_path = jax.jvp(path_fn, (t_vec,), (jnp.ones_like(t_vec),))
-
-    return z_path, v_path, {}
+    aux = {
+        "linear_path":           m_path,
+        "gp_mean_path":          z_bar,
+        "gp_mean_velocity":      v_bar,
+        "gp_mixing":             beta,
+        "gp_mixing_derivative":  dbeta,
+        "gp_posterior_variance": pvar,
+        "gp_confidence":         jnp.mean(1.0 - pvar),
+        "gp_chol_min_diag":      jnp.min(ldiag),
+        "gp_solve_is_finite":    jnp.all(jnp.isfinite(z_path)),
+    }
+    return z_path, v_path, aux

@@ -105,6 +105,8 @@ def train_step_stage2(
             gp_lengthscale=config.gp_lengthscale,
             gp_path_strength=config.gp_path_strength,
             gp_kernel=config.gp_kernel,
+            gp_obs_noise=getattr(config, 'gp_obs_noise', 0.01),
+            gp_jitter=getattr(config, 'gp_jitter', 1e-5),
             cond_seq_mask=cond_seq_mask,
             split_at=getattr(config, 'max_input_length', None),
         )
