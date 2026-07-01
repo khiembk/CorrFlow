@@ -68,7 +68,7 @@ class Config:
     use_path_gp: bool = False
     gp_path_strength: float = 1.0   # Blend strength γ ∈ [0, 1]
     gp_lengthscale: float = 1.0     # Kernel length scale ℓ for path-GP
-    gp_obs_noise: float = 0.01      # GP observation noise (ridge on active diagonal)
+    gp_obs_noise: float = 1.0       # GP observation noise; set to ~observation variance (ε*σ has var~4)
     gp_jitter: float = 1e-5         # Numerical jitter (all diagonal entries)
 
     # CorrNetwork φ_η (Stage 2: correlation network)

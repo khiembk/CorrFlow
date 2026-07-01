@@ -668,17 +668,23 @@ def sample_gp_path_correlation(
 ):
     """Exact analytic GP path and velocity. No jax.jvp. No stop_gradient.
 
+    Context observations are the LINEAR paths m_j(t)=t·x_j+(1-t)·ε_j·σ (NOT z_j).
+    Since m_j is linear in t, dz̄_i/dt = v̄_i = K_vec^T K_mat^{-1} v_lin_ctx
+    is time-independent.  This breaks the z_ctx→z̄→z→z_ctx feedback loop that
+    caused the exponential blow-up when z_ctx stored correlated z_j values.
+
     For each token i (left-to-right), static features f_j = [ν(ε^j), ν(x^j)] (2d):
         K_mat[b,j,k] = kernel(f_ctx_j, f_ctx_k) + diag(obs_noise·active + jitter)
         K_vec[b,j]   = kernel(f_i, f_ctx_j) · active_j
-        [alpha_z, alpha_v, alpha_k] = K_mat^{-1} @ [z_ctx, v_ctx, K_vec]  (Cholesky)
-        z̄_i  = K_vec^T @ alpha_z              (GP posterior mean over z)
-        v̄_i  = K_vec^T @ alpha_v              (GP posterior mean over v)
-        β_i   = γ · b(t) · c_i,   c_i = n_active/q,   b(t) = 16t²(1-t)²
-        z_i   = m_i + β_i · (z̄_i − m_i)
-        v_i   = v_lin,i + β'_i·(z̄_i − m_i) + β_i·(v̄_i − v_lin,i)    [exact, no sg]
+        [alpha_eps, alpha_v, alpha_k] = K_mat^{-1} @ [ε_ctx·σ, v_lin_ctx, K_vec]
+        z̄_i(0) = K_vec^T @ alpha_eps            (GP mean of ε_ctx·σ, static)
+        v̄_i    = K_vec^T @ alpha_v              (GP mean of v_lin_ctx, static)
+        z̄_i(t) = z̄_i(0) + t · v̄_i             (GP mean of m_ctx(t), exact)
+        β_i     = γ · b(t) · c_i,  c_i = n_active/q,  b(t) = 16t²(1-t)²
+        z_i     = m_i + β_i · (z̄_i(t) − m_i)
+        v_i     = v_lin,i + β'_i·(z̄_i(t)−m_i) + β_i·(v̄_i − v_lin,i)  [exact]
 
-    Kernel features are time-independent → dα/dt = 0 → stable exact velocity.
+    Carry: (src_ctx, tgt_ctx, feat_ctx, index) — no z_ctx/v_ctx needed.
 
     Args:
         x0:              (B, L, d) target embeddings
@@ -726,11 +732,13 @@ def sample_gp_path_correlation(
         return jsp_linalg.solve_triangular(lt, r, lower=False)
 
     def step_fn(carry, xs):
-        src_ctx, tgt_ctx, feat_ctx, z_ctx, v_ctx, step_idx = carry
-        # src_ctx, tgt_ctx: (B, q, d); feat_ctx: (B, q, 2d); z_ctx, v_ctx: (B, q, d)
+        src_ctx, tgt_ctx, feat_ctx, step_idx = carry
+        # src_ctx: (B, q, d) = ε of context tokens (unscaled)
+        # tgt_ctx: (B, q, d) = x of context tokens
+        # feat_ctx: (B, q, 2d) = static features of context tokens
         noise_i, x0_i = xs  # (B, d) each
 
-        t_e     = t_b.astype(work_dtype)[:, None]         # (B, 1)
+        t_e     = t_b.astype(work_dtype)[:, None]              # (B, 1)
         m_i     = t_e * x0_i + (1.0 - t_e) * noise_i * sigma  # (B, d)
         v_lin_i = x0_i - noise_i * sigma                        # (B, d)
 
@@ -740,92 +748,87 @@ def sample_gp_path_correlation(
         active_mask = (jnp.arange(gp_q) < step_idx).astype(jnp.float32)  # (q,)
         n_active    = jnp.sum(active_mask)
 
-        # --- kernel matrices (float32) ---
+        # --- Kernel matrices (float32) ---
         fc = feat_ctx  # (B, q, 2d) float32
 
-        # K_vec[b,j] = kernel(f_i[b], fc[b,j]) * active[j]
-        diff_qc = f_i[:, None, :] - fc          # (B, q, 2d)
-        D_ms_qc = jnp.sum(diff_qc ** 2, axis=-1) / feat_dim   # (B, q)
+        diff_qc = f_i[:, None, :] - fc                            # (B, q, 2d)
+        D_ms_qc = jnp.sum(diff_qc ** 2, axis=-1) / feat_dim       # (B, q)
         if gp_kernel == "rbf":
             K_vec = jnp.exp(-D_ms_qc / (2.0 * gp_lengthscale ** 2))
         else:
             K_vec = jnp.exp(-jnp.sqrt(D_ms_qc + 1e-8) / gp_lengthscale)
-        K_vec = K_vec * active_mask[None, :]    # (B, q)
+        K_vec = K_vec * active_mask[None, :]                       # (B, q)
 
-        # K_mat[b,j,k] = kernel(fc[b,j], fc[b,k])
-        diff_cc = fc[:, :, None, :] - fc[:, None, :, :]         # (B, q, q, 2d)
-        D_ms_cc = jnp.sum(diff_cc ** 2, axis=-1) / feat_dim      # (B, q, q)
+        diff_cc = fc[:, :, None, :] - fc[:, None, :, :]           # (B, q, q, 2d)
+        D_ms_cc = jnp.sum(diff_cc ** 2, axis=-1) / feat_dim       # (B, q, q)
         if gp_kernel == "rbf":
             K_mat = jnp.exp(-D_ms_cc / (2.0 * gp_lengthscale ** 2))
         else:
             K_mat = jnp.exp(-jnp.sqrt(D_ms_cc + 1e-8) / gp_lengthscale)
 
-        # Mask inactive pairs and regularize
-        I_active = active_mask[:, None] * active_mask[None, :]  # (q, q)
+        I_active = active_mask[:, None] * active_mask[None, :]    # (q, q)
         diag_reg = jnp.diag(active_mask * gp_obs_noise + jnp.ones(gp_q) * gp_jitter)
-        K_mat    = K_mat * I_active[None] + diag_reg[None]       # (B, q, q)
+        K_mat    = K_mat * I_active[None] + diag_reg[None]        # (B, q, q)
 
-        # --- Cholesky solve: K_mat @ [alpha_z, alpha_v, alpha_k] = [z_ctx, v_ctx, K_vec] ---
-        z_ctx_f32  = z_ctx.astype(jnp.float32)   # (B, q, d)
-        v_ctx_f32  = v_ctx.astype(jnp.float32)   # (B, q, d)
-        K_vec_col  = K_vec[..., None]             # (B, q, 1)
-        rhs = jnp.concatenate([z_ctx_f32, v_ctx_f32, K_vec_col], axis=-1)  # (B, q, 2d+1)
+        # --- Cholesky solve: rhs = [ε_ctx·σ, v_lin_ctx, K_vec] — all static/bounded ---
+        # Observations are linear paths m_ctx(t)=ε_ctx·σ + t·v_lin_ctx, not z_ctx.
+        # This prevents the z_ctx amplification blow-up.
+        eps_ctx_scaled = (src_ctx * sigma).astype(jnp.float32)    # (B, q, d)
+        v_lin_ctx_f32  = (tgt_ctx - src_ctx * sigma).astype(jnp.float32)  # (B, q, d)
+        K_vec_col      = K_vec[..., None]                          # (B, q, 1)
+        rhs = jnp.concatenate([eps_ctx_scaled, v_lin_ctx_f32, K_vec_col], axis=-1)
 
-        L_chol = jnp.linalg.cholesky(K_mat)                          # (B, q, q)
-        y      = jax.vmap(_fwd)(L_chol, rhs)                         # (B, q, 2d+1)
-        alpha  = jax.vmap(_bwd)(L_chol, y)                           # (B, q, 2d+1)
+        L_chol = jnp.linalg.cholesky(K_mat)
+        y      = jax.vmap(_fwd)(L_chol, rhs)
+        alpha  = jax.vmap(_bwd)(L_chol, y)                        # (B, q, 2d+1)
 
-        alpha_z = alpha[..., :d].astype(work_dtype)   # (B, q, d)
-        alpha_v = alpha[..., d:2*d].astype(work_dtype) # (B, q, d)
-        alpha_k = alpha[..., 2*d]                      # (B, q) float32
+        alpha_eps = alpha[..., :d].astype(work_dtype)              # (B, q, d)
+        alpha_v   = alpha[..., d:2*d].astype(work_dtype)           # (B, q, d)
+        alpha_k   = alpha[..., 2*d]                                # (B, q) float32
 
-        # --- GP posterior means ---
-        K_vec_w = K_vec.astype(work_dtype)
-        z_bar_i = jnp.einsum("bq,bqd->bd", K_vec_w, alpha_z)  # (B, d)
-        v_bar_i = jnp.einsum("bq,bqd->bd", K_vec_w, alpha_v)  # (B, d)
+        # --- GP posterior means (both time-independent) ---
+        K_vec_w  = K_vec.astype(work_dtype)
+        z_bar_i0 = jnp.einsum("bq,bqd->bd", K_vec_w, alpha_eps)   # K·α_ε  (B, d)
+        v_bar_i  = jnp.einsum("bq,bqd->bd", K_vec_w, alpha_v)     # K·α_v  (B, d)
+        # z̄_i(t) = z̄_i(0) + t·v̄_i  [GP mean of m_ctx(t), exact linear-in-t]
+        z_bar_i  = z_bar_i0 + t_b.astype(work_dtype)[:, None] * v_bar_i   # (B, d)
 
         # --- Bridge factors ---
-        t_s   = t_b                                                              # (B,) float32
-        b_t   = gp_bridge(t_s).astype(work_dtype)[:, None]                      # (B, 1)
-        db_t  = gp_bridge_derivative(t_s).astype(work_dtype)[:, None]           # (B, 1)
+        b_t   = gp_bridge(t_b).astype(work_dtype)[:, None]            # (B, 1)
+        db_t  = gp_bridge_derivative(t_b).astype(work_dtype)[:, None] # (B, 1)
         c_i   = (n_active / gp_q).astype(work_dtype)
-        beta  = gp_path_strength * b_t * c_i    # (B, 1)
-        dbeta = gp_path_strength * db_t * c_i   # (B, 1)
+        beta  = gp_path_strength * b_t * c_i                          # (B, 1)
+        dbeta = gp_path_strength * db_t * c_i                         # (B, 1)
 
         # --- Exact analytic path and velocity ---
-        delta_z = z_bar_i - m_i                                   # (B, d)
-        z_i = m_i + beta * delta_z                                 # (B, d)
-        v_i = v_lin_i + dbeta * delta_z + beta * (v_bar_i - v_lin_i)  # (B, d)
+        delta_z = z_bar_i - m_i
+        z_i = m_i + beta * delta_z
+        v_i = v_lin_i + dbeta * delta_z + beta * (v_bar_i - v_lin_i)
 
         # --- Diagnostics ---
         post_var_i = jnp.maximum(
             1.0 - jnp.einsum("bq,bq->b", K_vec, alpha_k), 0.0
-        ).astype(work_dtype)  # (B,)
+        ).astype(work_dtype)
         L_diag_min_i = jnp.min(
             jnp.diagonal(L_chol, axis1=-2, axis2=-1), axis=-1
-        ).astype(work_dtype)  # (B,)
+        ).astype(work_dtype)
 
-        # --- Update carry ---
+        # --- Update carry (src/tgt/feat only — no z/v carry needed) ---
         new_src_ctx  = jnp.concatenate([noise_i[:, None, :], src_ctx[:, :-1, :]], axis=1)
-        new_tgt_ctx  = jnp.concatenate([x0_i[:, None, :], tgt_ctx[:, :-1, :]], axis=1)
-        new_feat_ctx = jnp.concatenate([f_i[:, None, :], feat_ctx[:, :-1, :]], axis=1)
-        new_z_ctx    = jnp.concatenate([z_i[:, None, :], z_ctx[:, :-1, :]], axis=1)
-        new_v_ctx    = jnp.concatenate([v_i[:, None, :], v_ctx[:, :-1, :]], axis=1)
+        new_tgt_ctx  = jnp.concatenate([x0_i[:, None, :],   tgt_ctx[:, :-1, :]], axis=1)
+        new_feat_ctx = jnp.concatenate([f_i[:, None, :],    feat_ctx[:, :-1, :]], axis=1)
 
-        new_carry = (new_src_ctx, new_tgt_ctx, new_feat_ctx, new_z_ctx, new_v_ctx,
-                     step_idx + 1)
+        new_carry = (new_src_ctx, new_tgt_ctx, new_feat_ctx, step_idx + 1)
         outs = (z_i, v_i, m_i, z_bar_i, v_bar_i,
                 beta[:, 0], dbeta[:, 0], post_var_i, L_diag_min_i)
         return new_carry, outs
 
     def _run_scan(xs_pair):
         init_carry = (
-            jnp.zeros((B, gp_q, d),        dtype=work_dtype),  # src_ctx
-            jnp.zeros((B, gp_q, d),        dtype=work_dtype),  # tgt_ctx
-            jnp.zeros((B, gp_q, feat_dim), dtype=jnp.float32), # feat_ctx
-            jnp.zeros((B, gp_q, d),        dtype=work_dtype),  # z_ctx
-            jnp.zeros((B, gp_q, d),        dtype=work_dtype),  # v_ctx
-            jnp.zeros((),                  dtype=jnp.int32),   # step_idx
+            jnp.zeros((B, gp_q, d),        dtype=work_dtype),   # src_ctx
+            jnp.zeros((B, gp_q, d),        dtype=work_dtype),   # tgt_ctx
+            jnp.zeros((B, gp_q, feat_dim), dtype=jnp.float32),  # feat_ctx
+            jnp.zeros((),                  dtype=jnp.int32),    # step_idx
         )
         _, outs = jax.lax.scan(step_fn, init_carry, xs_pair)
         return outs  # each: (S, B, ...)

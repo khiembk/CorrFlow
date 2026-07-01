@@ -27,6 +27,8 @@ gp_q: 4
 gp_path_strength: 1.0
 gp_lengthscale: 1.0
 gp_kernel: rbf
+gp_obs_noise: 1.0
+gp_jitter: 0.00001
 
 corr_model: CorrNet-L
 
