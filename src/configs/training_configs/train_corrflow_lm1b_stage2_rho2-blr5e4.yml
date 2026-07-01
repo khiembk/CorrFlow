@@ -1,0 +1,70 @@
+# Stage 2: CorrNet-L on LM1B, gp_rho=2.0, blr=5e-4.
+# Backbone: locally trained CorrFlow Stage 1 (ELF-B, 104M, 996k steps, epoch 5).
+
+data_path: "/home.na1/ad.wsu.edu/khiem.tran/pvt/data/lm1b_train_t5"
+eval_data_path: null
+max_length: 128
+pad_token: eos
+
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+model: ELF-B
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+backbone_checkpoint: "/home.na1/ad.wsu.edu/khiem.tran/pvt/CorrFlow/src/outputs/corrflow_stage1-lm1b/checkpoint_996904"
+
+gp_q: 4
+gp_rho: 2.0
+gp_kernel: content
+
+corr_model: CorrNet-L
+
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+self_cond_prob: 0.5
+label_drop_prob: 0.0
+
+epochs: 5
+max_steps: 30000
+global_batch_size: 512
+generation_batch_size: 256
+blr: 0.0005
+weight_decay: 0.0
+warmup_steps: 500
+warmup_epochs: -1
+optimizer: muon
+
+ema_decay1: 0.9999
+
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+num_samples: 1000
+
+online_eval: true
+eval_ppl_model: "gpt2-large"
+eval_ppl_batch_size: 32
+eval_ppl_max_length: 128
+
+log_freq: 100
+save_freq: 1
+eval_freq: 1
+
+output_dir: "outputs/lm1b_stage2_rho2-blr5e4"
+hf_repo_id: null
+resume: null
+
+use_wandb: true
+wandb_project: corrflow
+wandb_entity: null
+wandb_run_name: lm1b_stage2_rho2-blr5e4
+
+seed: 42
