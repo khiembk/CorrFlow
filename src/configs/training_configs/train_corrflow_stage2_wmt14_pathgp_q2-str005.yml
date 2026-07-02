@@ -42,7 +42,7 @@ self_cond_prob: 0.5
 label_drop_prob: 0.1
 
 epochs: 5
-max_steps: 20000
+max_steps: 44030
 global_batch_size: 512
 blr: 0.001
 weight_decay: 0.0
@@ -64,7 +64,7 @@ eval_freq: 1
 
 output_dir: "outputs/wmt14_stage2_pathgp-q2-str005"
 hf_repo_id: null
-resume: null
+resume: "outputs/wmt14_stage2_pathgp-q2-str005"
 
 use_wandb: true
 wandb_project: corrflow

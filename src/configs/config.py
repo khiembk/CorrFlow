@@ -71,6 +71,19 @@ class Config:
     gp_obs_noise: float = 1.0       # GP observation noise; set to ~observation variance (ε*σ has var~4)
     gp_jitter: float = 1e-5         # Numerical jitter (all diagonal entries)
 
+    # PDE-inspired GP path (PyTorch, experimental; path_type: pde_inspired_gp)
+    # Example YAML:
+    #   path_type: pde_inspired_gp
+    #   pde_inspired_gp:
+    #     q: 2
+    #     log_length_scale: 0.0
+    #     trainable_length_scale: false
+    #     time_scale: 1.0
+    #     context_scale: 1.0
+    #     denominator_eps: 1.0e-6
+    path_type: str = None
+    pde_inspired_gp: dict = None
+
     # CorrNetwork φ_η (Stage 2: correlation network)
     corr_model: str = 'CorrNet-M'  # Size variant: CorrNet-S (h=128), CorrNet-M (h=256), CorrNet-L (h=512)
     backbone_checkpoint: str = None  # Path to frozen Stage 1 checkpoint (Stage 2 only)

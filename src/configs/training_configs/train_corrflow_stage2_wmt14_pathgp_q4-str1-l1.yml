@@ -42,7 +42,6 @@ self_cond_prob: 0.5
 label_drop_prob: 0.1
 
 epochs: 5
-max_steps: 20000
 global_batch_size: 512
 blr: 0.001
 weight_decay: 0.0
