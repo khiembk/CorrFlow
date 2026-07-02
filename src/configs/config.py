@@ -71,6 +71,13 @@ class Config:
     gp_obs_noise: float = 1.0       # GP observation noise; set to ~observation variance (ε*σ has var~4)
     gp_jitter: float = 1e-5         # Numerical jitter (all diagonal entries)
 
+    # PDE-inspired GP path — JAX training (use_pde_gp=True)
+    use_pde_gp: bool = False
+    pde_time_scale: float = 1.0         # τ: time-dimension weight in GP distance
+    pde_context_scale: float = 1.0      # κ: context-path weight in GP distance
+    pde_log_length_scale: float = 0.0   # log ℓ (clamped to [-5, 3])
+    pde_denominator_eps: float = 1e-6   # fallback threshold for 1−a²
+
     # PDE-inspired GP path (PyTorch, experimental; path_type: pde_inspired_gp)
     # Example YAML:
     #   path_type: pde_inspired_gp

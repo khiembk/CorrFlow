@@ -26,7 +26,8 @@ import jax.numpy as jnp
 from utils.train_utils import TrainState
 from utils.encoder_utils import encode_text
 from utils.sampling_utils import (
-    sample_timesteps, sample_gp_path, sample_gp_path_correlation, net_out_to_v_x,
+    sample_timesteps, sample_gp_path, sample_gp_path_correlation,
+    sample_pde_gp_path, net_out_to_v_x,
 )
 
 
@@ -98,7 +99,19 @@ def train_step_stage2(
 
     noise = jax.random.normal(noise_rng, x0.shape, dtype=x0.dtype)  # (B, L, d)
 
-    if getattr(config, 'use_path_gp', False):
+    if getattr(config, 'use_pde_gp', False):
+        z_gp, v_gp, _ = sample_pde_gp_path(
+            x0, noise, t,
+            gp_q=config.gp_q,
+            pde_time_scale=getattr(config, 'pde_time_scale', 1.0),
+            pde_context_scale=getattr(config, 'pde_context_scale', 1.0),
+            pde_log_length_scale=getattr(config, 'pde_log_length_scale', 0.0),
+            pde_denominator_eps=getattr(config, 'pde_denominator_eps', 1e-6),
+            noise_scale=config.denoiser_noise_scale,
+            cond_seq_mask=cond_seq_mask,
+            split_at=getattr(config, 'max_input_length', None),
+        )
+    elif getattr(config, 'use_path_gp', False):
         z_gp, v_gp, _ = sample_gp_path_correlation(
             x0, noise, t,
             gp_q=config.gp_q,

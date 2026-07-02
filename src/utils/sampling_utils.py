@@ -874,3 +874,227 @@ def sample_gp_path_correlation(
         "gp_solve_is_finite":    jnp.all(jnp.isfinite(z_path)),
     }
     return z_path, v_path, aux
+
+
+# ============================================
+# PDE-Inspired GP Path (Stage 2: causal recursive GP)
+# ============================================
+
+def sample_pde_gp_path(
+    x0,
+    source_noise,
+    t,
+    gp_q,
+    pde_time_scale=1.0,
+    pde_context_scale=1.0,
+    pde_log_length_scale=0.0,
+    pde_denominator_eps=1e-6,
+    noise_scale=2.0,
+    cond_seq_mask=None,
+    split_at=None,
+):
+    """PDE-inspired causal GP path with exact analytic recursive velocity.
+
+    Each token i is driven by the previous q tokens' ACTUAL generated paths
+    (not linear paths), giving a fully causal recursive GP.
+
+    Two GP observations per token i:
+        (t=0, [ε_{i-q}…ε_{i-1}]) -> ε_i      (source endpoint)
+        (t=1, [x_{i-q}…x_{i-1}]) -> x_i      (target endpoint)
+    Query: (t, [z_{i-q}(t)…z_{i-1}(t)])       (context generated paths)
+
+    Squared distances (τ=time_scale, κ=context_scale, ℓ²=exp(2·log_ell)):
+        R²_{i,0}(t) = τ²t²      + (κ²/c·d) Σ_j ||z_j(t) − ε_j||²
+        R²_{i,1}(t) = τ²(1−t)²  + (κ²/c·d) Σ_j ||z_j(t) − x_j||²
+        R²_{i,01}   = τ²         + (κ²/c·d) Σ_j ||x_j   − ε_j||²
+
+    GP kernel:  k_r(t) = exp(−R²_{i,r}(t) / 2ℓ²),  a_i = exp(−R²_{i,01} / 2ℓ²)
+    Weights:    w0 = (k0−a·k1)/(1−a²),   w1 = (k1−a·k0)/(1−a²)
+    Path:       z_i(t) = w0·ε_i + w1·x_i
+    Velocity:   v_i(t) = ẇ0·ε_i + ẇ1·x_i   (exact, via recursive v_j)
+
+    First token (c=0) uses the ordinary linear interpolation.
+    Ill-conditioned denominator (1−a²<eps) falls back to linear interpolation.
+
+    Args:
+        x0:                   (B, L, d) target embeddings.
+        source_noise:         (B, L, d) unscaled source noise ε (multiplied by
+                              noise_scale internally to form the source endpoint).
+        t:                    scalar or (B,) timesteps in [0, 1].
+        gp_q:                 int context window size (>= 1).
+        pde_time_scale:       τ — weight on the time dimension (default 1.0).
+        pde_context_scale:    κ — weight on context path distances (default 1.0).
+        pde_log_length_scale: log ℓ — clamped to [−5, 3] (default 0.0).
+        pde_denominator_eps:  fallback threshold for 1−a² (default 1e-6).
+        noise_scale:          σ — matches denoiser_noise_scale in config (default 2.0).
+        cond_seq_mask:        (B, L, 1) optional; 1=pin to clean x0.
+        split_at:             int optional — reset GP carry at this position.
+
+    Returns:
+        z_path: (B, L, d)  GP-path latent at time t.
+        v_path: (B, L, d)  exact analytic velocity.
+        aux:    dict with per-token diagnostics, each shape (B, L).
+    """
+    sigma = noise_scale
+    B, L, d = x0.shape
+    work_dtype = x0.dtype
+
+    t_arr = jnp.asarray(t, dtype=jnp.float32)
+    if t_arr.ndim == 0:
+        t_b = jnp.broadcast_to(t_arr, (B,))
+    else:
+        t_b = t_arr.reshape(B)
+
+    log_ell  = jnp.clip(jnp.float32(pde_log_length_scale), -5.0, 3.0)
+    ell_sq   = jnp.exp(2.0 * log_ell)
+    tau_sq   = float(pde_time_scale) ** 2
+    kappa_sq = float(pde_context_scale) ** 2
+    denom_eps = float(pde_denominator_eps)
+
+    x0_T    = x0.transpose(1, 0, 2)            # (L, B, d)
+    noise_T = source_noise.transpose(1, 0, 2)  # (L, B, d)
+
+    def step_fn(carry, xs):
+        src_ctx, tgt_ctx, path_ctx, vel_ctx, step_idx = carry
+        # src_ctx:  (B, q, d) raw noise for context tokens
+        # tgt_ctx:  (B, q, d) x0 for context tokens
+        # path_ctx: (B, q, d) generated z_t of context tokens
+        # vel_ctx:  (B, q, d) generated v_t of context tokens
+        noise_i, x0_i = xs  # (B, d)
+
+        t_e = t_b.astype(work_dtype)[:, None]  # (B, 1)
+
+        # Source/target endpoints for token i
+        eps_i = noise_i * sigma  # (B, d): source endpoint ε_i
+        # Linear interpolation (first-token fallback)
+        lin_z = (1.0 - t_e) * eps_i + t_e * x0_i  # (B, d)
+        lin_v = x0_i - eps_i                        # (B, d)
+
+        # Active context mask: slot j active if j < c = min(step_idx, q)
+        c     = jnp.minimum(step_idx, jnp.int32(gp_q))
+        active = (jnp.arange(gp_q) < c).astype(jnp.float32)  # (q,)
+        safe_c = jnp.maximum(c, 1).astype(jnp.float32)
+        normalizer = safe_c * jnp.float32(d)
+
+        # Scaled source endpoints of context tokens
+        eps_ctx = src_ctx * sigma  # (B, q, d): ε_j for context
+
+        # Differences (B, q, d)
+        diff_0  = path_ctx - eps_ctx   # z_j(t) − ε_j
+        diff_1  = path_ctx - tgt_ctx   # z_j(t) − x_j
+        diff_01 = tgt_ctx  - eps_ctx   # x_j − ε_j
+
+        # Broadcast active mask: (1, q, 1)
+        am = active[None, :, None]
+
+        # Context distances, summed over active (q, d) → (B,), normalized by c·d
+        ctx_d0  = jnp.sum(am * diff_0**2,  axis=(1, 2)) / normalizer
+        ctx_d1  = jnp.sum(am * diff_1**2,  axis=(1, 2)) / normalizer
+        ctx_d01 = jnp.sum(am * diff_01**2, axis=(1, 2)) / normalizer
+
+        # Full squared distances (B,)
+        t_b32 = t_b.astype(jnp.float32)
+        dist_0  = tau_sq * t_b32**2          + kappa_sq * ctx_d0
+        dist_1  = tau_sq * (1.0 - t_b32)**2 + kappa_sq * ctx_d1
+        dist_01 = tau_sq                     + kappa_sq * ctx_d01
+
+        # Kernel values (B,)
+        k0 = jnp.exp(-dist_0  / (2.0 * ell_sq))
+        k1 = jnp.exp(-dist_1  / (2.0 * ell_sq))
+        a  = jnp.exp(-dist_01 / (2.0 * ell_sq))
+
+        denom = 1.0 - a**2  # (B,)
+        well_cond  = denom > denom_eps
+        safe_denom = jnp.where(well_cond, denom, jnp.ones_like(denom))
+
+        # GP weights (B,)
+        w0_gp = (k0 - a * k1) / safe_denom
+        w1_gp = (k1 - a * k0) / safe_denom
+
+        # --- Exact analytic velocity ---
+        # dR²_{i,r}/dt = 2τ²(t−r) + (2κ²/c·d) Σ_j <z_j(t)−e_r^j, v_j(t)>
+        inner_0 = jnp.sum(am * diff_0 * vel_ctx, axis=(1, 2)) / normalizer
+        inner_1 = jnp.sum(am * diff_1 * vel_ctx, axis=(1, 2)) / normalizer
+
+        dR0_dt = 2.0 * tau_sq * t_b32          + 2.0 * kappa_sq * inner_0
+        dR1_dt = 2.0 * tau_sq * (t_b32 - 1.0)  + 2.0 * kappa_sq * inner_1
+
+        # dk/dt = −k/(2ℓ²) · dR²/dt
+        dk0_dt = -k0 * dR0_dt / (2.0 * ell_sq)
+        dk1_dt = -k1 * dR1_dt / (2.0 * ell_sq)
+
+        dw0_dt_gp = (dk0_dt - a * dk1_dt) / safe_denom
+        dw1_dt_gp = (dk1_dt - a * dk0_dt) / safe_denom
+
+        # Use linear fallback when ill-conditioned OR first token (c=0)
+        use_linear = (~well_cond) | (step_idx == 0)
+        w0     = jnp.where(use_linear, 1.0 - t_b32, w0_gp)
+        w1     = jnp.where(use_linear, t_b32,        w1_gp)
+        dw0_dt = jnp.where(use_linear, -jnp.ones_like(t_b32), dw0_dt_gp)
+        dw1_dt = jnp.where(use_linear,  jnp.ones_like(t_b32), dw1_dt_gp)
+
+        # Token path and velocity (B, d)
+        z_i = w0[:, None] * eps_i + w1[:, None] * x0_i
+        v_i = dw0_dt[:, None] * eps_i + dw1_dt[:, None] * x0_i
+
+        # Finite guard
+        finite = (jnp.isfinite(z_i).all(axis=-1) &
+                  jnp.isfinite(v_i).all(axis=-1))  # (B,)
+        z_i = jnp.where(finite[:, None], z_i, lin_z)
+        v_i = jnp.where(finite[:, None], v_i, lin_v)
+
+        # Update ring buffer: prepend newest, drop oldest
+        new_src  = jnp.concatenate([noise_i[:, None, :], src_ctx[:, :-1, :]], axis=1)
+        new_tgt  = jnp.concatenate([x0_i[:, None, :],   tgt_ctx[:, :-1, :]], axis=1)
+        new_path = jnp.concatenate([z_i[:, None, :],    path_ctx[:, :-1, :]], axis=1)
+        new_vel  = jnp.concatenate([v_i[:, None, :],    vel_ctx[:, :-1, :]], axis=1)
+
+        new_carry = (new_src, new_tgt, new_path, new_vel, step_idx + 1)
+        return new_carry, (
+            z_i, v_i,
+            k0, k1, a, denom,
+            well_cond.astype(jnp.float32),
+            finite.astype(jnp.float32),
+        )
+
+    def _run_scan(xs_pair):
+        init = (
+            jnp.zeros((B, gp_q, d), dtype=work_dtype),  # src_ctx
+            jnp.zeros((B, gp_q, d), dtype=work_dtype),  # tgt_ctx
+            jnp.zeros((B, gp_q, d), dtype=work_dtype),  # path_ctx
+            jnp.zeros((B, gp_q, d), dtype=work_dtype),  # vel_ctx
+            jnp.array(0, dtype=jnp.int32),               # step_idx
+        )
+        _, outs = jax.lax.scan(step_fn, init, xs_pair)
+        return outs  # each: (S, B, ...) where S = segment length
+
+    if split_at is not None:
+        outs_src = _run_scan((noise_T[:split_at], x0_T[:split_at]))
+        outs_tgt = _run_scan((noise_T[split_at:], x0_T[split_at:]))
+        outs = jax.tree_util.tree_map(
+            lambda a, b: jnp.concatenate([a, b], axis=0), outs_src, outs_tgt
+        )
+    else:
+        outs = _run_scan((noise_T, x0_T))
+
+    z_T, v_T, k0_T, k1_T, a_T, denom_T, wc_T, fin_T = outs  # each (L, B, ...)
+
+    # (L, B, d) → (B, L, d)
+    z_path = z_T.transpose(1, 0, 2)
+    v_path = v_T.transpose(1, 0, 2)
+
+    if cond_seq_mask is not None:
+        v_lin_all = x0 - source_noise * sigma
+        z_path = cond_seq_mask * x0 + (1.0 - cond_seq_mask) * z_path
+        v_path = cond_seq_mask * v_lin_all + (1.0 - cond_seq_mask) * v_path
+
+    aux = {
+        "k0":              k0_T.T,     # (B, L)
+        "k1":              k1_T.T,     # (B, L)
+        "endpoint_kernel": a_T.T,      # (B, L)
+        "denominator":     denom_T.T,  # (B, L)
+        "well_conditioned": wc_T.T,    # (B, L)
+        "is_finite":        fin_T.T,   # (B, L)
+        "gp_solve_is_finite": jnp.all(jnp.isfinite(z_path)),
+    }
+    return z_path, v_path, aux
