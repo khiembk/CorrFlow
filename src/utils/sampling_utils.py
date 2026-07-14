@@ -924,7 +924,7 @@ def sample_pde_gp_path(
         gp_q:                 int context window size (>= 1).
         pde_time_scale:       τ — weight on the time dimension (default 1.0).
         pde_context_scale:    κ — weight on context path distances (default 1.0).
-        pde_log_length_scale: log ℓ — clamped to [−5, 3] (default 0.0).
+        pde_log_length_scale: log ℓ — clamped to [−5, 6] (default 0.0).
         pde_denominator_eps:  fallback threshold for 1−a² (default 1e-6).
         noise_scale:          σ — matches denoiser_noise_scale in config (default 2.0).
         cond_seq_mask:        (B, L, 1) optional; 1=pin to clean x0.
@@ -945,7 +945,7 @@ def sample_pde_gp_path(
     else:
         t_b = t_arr.reshape(B)
 
-    log_ell  = jnp.clip(jnp.float32(pde_log_length_scale), -5.0, 3.0)
+    log_ell  = jnp.clip(jnp.float32(pde_log_length_scale), -5.0, 6.0)
     ell_sq   = jnp.exp(2.0 * log_ell)
     tau_sq   = float(pde_time_scale) ** 2
     kappa_sq = float(pde_context_scale) ** 2
