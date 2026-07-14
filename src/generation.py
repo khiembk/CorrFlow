@@ -43,12 +43,15 @@ def run_generation(
     local_batch_size: int,
     corr_apply_fn=None,
     corr_params=None,
+    use_z_input=False,
 ) -> PRNGKey:
     """Run test generation.
 
     For Stage 2, pass corr_apply_fn=corr_model.apply and corr_params (unreplicated
     EMA params) to compose v_con = v_ind + phi_eta during the ODE/SDE trajectory.
     The decode step (argmax of decoder logits) is unchanged.
+
+    use_z_input: set True for EmCorrNet, which takes (v_ind, z_t, t) instead of (v_ind, t).
     """
     for sc_idx, sc in enumerate(config.sampling_configs):
         if len(config.sampling_configs) > 1:
@@ -64,6 +67,7 @@ def run_generation(
             num_samples=config.num_samples,
             corr_apply_fn=corr_apply_fn,
             corr_params=corr_params,
+            use_z_input=use_z_input,
         )
         is_conditional = eval_dataset is not None and config.max_input_length is not None
         if is_conditional:
@@ -92,6 +96,7 @@ def test_generation_uncond(
     batch_size: int = 64,
     corr_apply_fn=None,
     corr_params=None,
+    use_z_input=False,
 ):
     """Test unconditional generation (multi-device pmap)."""
     sampling_method = sampling_config.sampling_method
@@ -110,6 +115,7 @@ def test_generation_uncond(
             corr_params=corr_params,
             d_model=d_model,
             t_eps=config.t_eps,
+            use_z_input=use_z_input,
         )
 
     pad_token_id = get_pad_token_id(tokenizer)
@@ -290,6 +296,7 @@ def test_generation_cond(
     batch_size: int = 64,
     corr_apply_fn=None,
     corr_params=None,
+    use_z_input=False,
 ):
     """Test conditional generation (multi-device pmap)."""
     sampling_method = sampling_config.sampling_method
@@ -308,6 +315,7 @@ def test_generation_cond(
             corr_params=corr_params,
             d_model=d_model,
             t_eps=config.t_eps,
+            use_z_input=use_z_input,
         )
 
     encode_latent_mean, encode_latent_std = config.latent_mean, config.latent_std

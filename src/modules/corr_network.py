@@ -137,9 +137,79 @@ def CorrNetwork_M(**kwargs): return CorrNetwork(hidden_dim=256, num_layers=2, **
 def CorrNetwork_XL(**kwargs): return CorrNetwork(hidden_dim=512, num_layers=2, **kwargs)
 def CorrNetwork_L(**kwargs): return CorrNetwork(hidden_dim=512, num_layers=4, **kwargs)
 
+
+class EmCorrNetwork(nn.Module):
+    """Embedding-augmented CorrNetwork (EmCorrNet).
+
+    Extends CorrNetwork by concatenating the current latent state z_t
+    with the independent velocity v_ind as input, giving the network
+    direct access to the actual path position at training time (z_gp_t)
+    and ODE state at inference time.
+
+        input:    [v_ind ‖ z_t]   (B, L, 2d)
+        in_proj:  2d → hidden_dim
+        blocks:   N × CausalConvBlock  (identical to CorrNetwork)
+        out_proj: hidden_dim → d       (zero-init)
+
+    At training:  z_t = z_gp_t  (the GP-curved path latent).
+    At inference: z_t = z        (the current ODE state, updated each step).
+    """
+    hidden_dim: int = 256
+    num_layers: int = 2
+    gp_q: int = 2
+
+    @nn.compact
+    def __call__(self, v_ind, z_t, t):
+        # v_ind: (B, L, d) — stop-gradient independent velocities
+        # z_t:   (B, L, d) — current latent state (z_gp at train, ODE state at inference)
+        # t:     (B,)      — current timestep in [0, 1]
+        d = v_ind.shape[-1]
+
+        t_emb = TimestepEmbedder(self.hidden_dim, name='t_emb')(t)
+        film = nn.Dense(
+            2 * self.hidden_dim, use_bias=True,
+            kernel_init=DEFAULT_KERNEL_INIT, bias_init=DEFAULT_BIAS_INIT,
+            name='film_proj',
+        )(nn.silu(t_emb))
+        gamma, beta = jnp.split(film, 2, axis=-1)
+
+        # Input: concat v_ind and z_t → (B, L, 2d) then project to hidden_dim.
+        x = nn.Dense(
+            self.hidden_dim, use_bias=True,
+            kernel_init=DEFAULT_KERNEL_INIT, bias_init=DEFAULT_BIAS_INIT,
+            name='in_proj',
+        )(jnp.concatenate([v_ind, z_t], axis=-1))
+
+        for i in range(self.num_layers):
+            x = CausalConvBlock(
+                hidden_dim=self.hidden_dim,
+                gp_q=self.gp_q,
+                name=f'block_{i}',
+            )(x, gamma, beta)
+
+        x = RMSNorm(self.hidden_dim, name='norm_out')(x)
+        delta_v = nn.Dense(
+            d, use_bias=True,
+            kernel_init=ZERO_INIT, bias_init=ZERO_INIT,
+            name='out_proj',
+        )(x)
+
+        return delta_v
+
+
+def EmCorrNetwork_S(**kwargs): return EmCorrNetwork(hidden_dim=128, num_layers=2, **kwargs)
+def EmCorrNetwork_M(**kwargs): return EmCorrNetwork(hidden_dim=256, num_layers=2, **kwargs)
+def EmCorrNetwork_L(**kwargs): return EmCorrNetwork(hidden_dim=512, num_layers=4, **kwargs)
+def EmCorrNetwork_XL(**kwargs): return EmCorrNetwork(hidden_dim=512, num_layers=4, **kwargs)
+
+
 CorrNetwork_models = {
-    'CorrNet-S': CorrNetwork_S,
-    'CorrNet-M': CorrNetwork_M,
-    'CorrNet-XL': CorrNetwork_XL,
-    'CorrNet-L': CorrNetwork_L,
+    'CorrNet-S':    CorrNetwork_S,
+    'CorrNet-M':    CorrNetwork_M,
+    'CorrNet-XL':   CorrNetwork_XL,
+    'CorrNet-L':    CorrNetwork_L,
+    'EmCorrNet-S':  EmCorrNetwork_S,
+    'EmCorrNet-M':  EmCorrNetwork_M,
+    'EmCorrNet-L':  EmCorrNetwork_L,
+    'EmCorrNet-XL': EmCorrNetwork_XL,
 }

@@ -120,13 +120,18 @@ def run_eval(config, ckpt_path=None, baseline=False):
     corr_params_for_gen = None
     gen_step = 0
 
+    is_em_corr = config.corr_model.startswith('EmCorrNet')
     if not baseline:
         log_for_0(f"Initialising CorrNetwork ({config.corr_model}, gp_q={config.gp_q})...")
         corr_model = CorrNetwork_models[config.corr_model](gp_q=config.gp_q)
         rng, init_rng, dropout_rng = jax.random.split(rng, 3)
         dummy_v_ind = jnp.ones((1, config.max_length, d_model))
         dummy_t = jnp.ones((1,))
-        corr_params_init = corr_model.init(init_rng, dummy_v_ind, dummy_t)
+        if is_em_corr:
+            dummy_z = jnp.ones((1, config.max_length, d_model))
+            corr_params_init = corr_model.init(init_rng, dummy_v_ind, dummy_z, dummy_t)
+        else:
+            corr_params_init = corr_model.init(init_rng, dummy_v_ind, dummy_t)
 
         dummy_lr_fn = create_learning_rate_fn(num_train_steps=1, num_warmup_steps=0, learning_rate=1e-3)
         dummy_optimizer = get_optimizer(config, dummy_lr_fn)
@@ -174,6 +179,7 @@ def run_eval(config, ckpt_path=None, baseline=False):
         local_batch_size=local_batch_size,
         corr_apply_fn=corr_apply_fn,
         corr_params=corr_params_for_gen,
+        use_z_input=is_em_corr,
     )
 
 

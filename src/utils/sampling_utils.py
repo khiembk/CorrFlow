@@ -489,7 +489,8 @@ def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
 # Stage 2 — conditional velocity wrapper
 # ============================================
 
-def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_model, t_eps):
+def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_model, t_eps,
+                              use_z_input=False):
     """Return a drop-in backbone apply_fn that adds the CorrNetwork velocity correction.
 
     During ODE/SDE sampling the caller does:
@@ -498,7 +499,8 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
 
     We replace x_pred with x_pred_modified so that net_out_to_v_x yields v_con:
         v_ind  = (x_pred - z) / max(1-t, t_eps)
-        v_con  = v_ind + phi_eta(v_ind, t)
+        v_con  = v_ind + phi_eta(v_ind, t)            [CorrNet]
+              or v_ind + phi_eta(v_ind, z, t)          [EmCorrNet, use_z_input=True]
         x_pred_modified = v_con * max(1-t, t_eps) + z
 
     The decode step uses only decoder_logits (the second element of the tuple) and
@@ -507,6 +509,10 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
     Self-conditioning: z_input may be [z, x_pred_prev] concatenated along the last
     dim (shape B×L×2d). We always extract z = z_input[..., :d_model] which is safe
     for both the conditioned (2d) and unconditioned (d) cases.
+
+    Args:
+        use_z_input: if True, pass the current latent z as second positional arg to
+                     corr_apply_fn (EmCorrNet signature: v_ind, z_t, t).
     """
     def wrapped_apply_fn(params, z_input, t, **kwargs):
         net_out = backbone_apply_fn(params, z_input, t, **kwargs)
@@ -521,7 +527,10 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
         # Compute v_ind, apply phi_eta, back-project to x_pred space
         t_denom = jnp.maximum(1.0 - t[:, None, None], t_eps)
         v_ind = (x_pred - z) / t_denom
-        delta_v = corr_apply_fn({"params": corr_params}, v_ind, t)
+        if use_z_input:
+            delta_v = corr_apply_fn({"params": corr_params}, v_ind, z, t)
+        else:
+            delta_v = corr_apply_fn({"params": corr_params}, v_ind, t)
         v_con = v_ind + delta_v
         x_pred_modified = v_con * t_denom + z
 

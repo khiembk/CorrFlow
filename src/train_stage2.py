@@ -285,8 +285,14 @@ def run_training(config):
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
     dummy_v_ind = jnp.ones((1, config.max_length, d_model))
     dummy_t = jnp.ones((1,))
-    corr_params = corr_model.init(init_rng, dummy_v_ind, dummy_t)
-    log_for_0("\n" + corr_model.tabulate(init_rng, dummy_v_ind, dummy_t))
+    is_em_corr = config.corr_model.startswith('EmCorrNet')
+    if is_em_corr:
+        dummy_z = jnp.ones((1, config.max_length, d_model))
+        corr_params = corr_model.init(init_rng, dummy_v_ind, dummy_z, dummy_t)
+        log_for_0("\n" + corr_model.tabulate(init_rng, dummy_v_ind, dummy_z, dummy_t))
+    else:
+        corr_params = corr_model.init(init_rng, dummy_v_ind, dummy_t)
+        log_for_0("\n" + corr_model.tabulate(init_rng, dummy_v_ind, dummy_t))
     total_corr_params = sum(x.size for x in jax.tree_util.tree_leaves(corr_params))
     log_for_0(f"CorrNetwork trainable parameters: {total_corr_params:,}")
 
@@ -521,6 +527,7 @@ def run_training(config):
                 local_batch_size=gen_batch_size,
                 corr_apply_fn=corr_model.apply,
                 corr_params=corr_unreplicated.ema_params1,
+                use_z_input=is_em_corr,
             )
 
         if config.max_steps is not None and global_step >= config.max_steps:

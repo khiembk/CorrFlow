@@ -169,10 +169,17 @@ def train_step_stage2(
         v_ind = jax.lax.stop_gradient(v_ind_raw)
 
         # --- correlation network predicts per-token velocity correction ---
-        delta_v = corr_state.apply_fn(
-            {"params": corr_params},
-            v_ind, t,
-        )  # (B, L, d)
+        # EmCorrNet receives the GP latent z_gp as an extra input (stop-gradient).
+        if config.corr_model.startswith('EmCorrNet'):
+            delta_v = corr_state.apply_fn(
+                {"params": corr_params},
+                v_ind, jax.lax.stop_gradient(z_gp), t,
+            )  # (B, L, d)
+        else:
+            delta_v = corr_state.apply_fn(
+                {"params": corr_params},
+                v_ind, t,
+            )  # (B, L, d)
 
         # --- composed velocity and GP-target loss ---
         v_con = v_ind + delta_v
