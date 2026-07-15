@@ -135,7 +135,6 @@ def train_step_stage2(
         )  # z_gp: (B, L, d), v_gp: (B, L, d)
 
     # ------------------------------------------------------------------ backbone input
-    # Run the frozen backbone without self-conditioning: zero out the self-cond slot.
     if config.self_cond_prob > 0:
         z_gp_input = jnp.concatenate([z_gp, jnp.zeros_like(z_gp)], axis=-1)  # (B, L, 2d)
     else:
@@ -165,7 +164,7 @@ def train_step_stage2(
         )
         # backbone always returns (x_pred, decoder_logits); decode the tuple safely.
         v_ind_raw, _x_pred = net_out_to_v_x(backbone_out, z_gp, t, t_eps)
-        # v_ind = (D_theta(z_gp_t, t) - z_gp_t) / max(1-t, t_eps)  — stop-gradient
+        # v_ind = (D_theta(z_gp, t) - z_gp) / max(1-t, t_eps)  — stop-gradient
         v_ind = jax.lax.stop_gradient(v_ind_raw)
 
         # --- correlation network predicts per-token velocity correction ---
