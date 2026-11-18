@@ -42,7 +42,7 @@ import wandb
 
 from modules.t5_encoder import get_encoder
 from modules.model import ELF_models
-from modules.corr_network import CorrNetwork_models
+from modules.corr_network import CorrNetwork_models, CNPPathNet_models
 from utils.logging_utils import log_for_0
 from utils.checkpoint_utils import (
     save_checkpoint, load_encoder_checkpoint, load_checkpoint,
@@ -278,6 +278,32 @@ def run_training(config):
     frozen_backbone_params = jax_utils.replicate(frozen_backbone_params)
     log_for_0("Frozen backbone replicated to all devices.")
 
+    # ------------------------------------------------------------------ frozen CNPPathNet (optional, two-phase CNP path)
+    cnp_model, frozen_cnp_params = None, None
+    if getattr(config, 'use_cnp_gp', False):
+        if not getattr(config, 'cnp_checkpoint', None):
+            raise ValueError(
+                "cnp_checkpoint must be set when use_cnp_gp=true (path to a "
+                "pretrain_cnp.py output directory)."
+            )
+        log_for_0(f"Loading frozen CNPPathNet ({config.cnp_model}) from {config.cnp_checkpoint}...")
+        cnp_model = CNPPathNet_models[config.cnp_model](gp_q=config.gp_q)
+        rng, cnp_init_rng, cnp_dropout_rng = jax.random.split(rng, 3)
+        dummy_x0 = jnp.ones((1, config.max_length, d_model))
+        cnp_params_init = cnp_model.init(cnp_init_rng, dummy_x0)
+        dummy_cnp_lr = create_learning_rate_fn(num_train_steps=1, num_warmup_steps=0, learning_rate=1e-3)
+        dummy_cnp_optimizer = get_optimizer(config, dummy_cnp_lr)
+        cnp_state_template = TrainState.create(
+            apply_fn=cnp_model.apply, params=cnp_params_init["params"], tx=dummy_cnp_optimizer,
+            dropout_rng=cnp_dropout_rng, ema_params1=copy.deepcopy(cnp_params_init["params"]),
+        )
+        cnp_ckpt_path = config.cnp_checkpoint
+        if "checkpoint_" not in cnp_ckpt_path:
+            cnp_ckpt_path = find_latest_checkpoint(cnp_ckpt_path) or cnp_ckpt_path
+        cnp_state_template, cnp_resume_step = load_checkpoint(cnp_ckpt_path, cnp_state_template)
+        log_for_0(f"Loaded frozen CNPPathNet EMA params from step {cnp_resume_step}.")
+        frozen_cnp_params = jax_utils.replicate(cnp_state_template.ema_params1)
+
     # ------------------------------------------------------------------ CorrNetwork (trainable)
     log_for_0(f"Creating CorrNetwork ({config.corr_model}, gp_q={config.gp_q})...")
     corr_model = CorrNetwork_models[config.corr_model](gp_q=config.gp_q)
@@ -339,6 +365,7 @@ def run_training(config):
             backbone_apply_fn=backbone_model.apply,
             encoder_apply_fn=encoder_model.apply,
             config=config,
+            cnp_apply_fn=cnp_model.apply if cnp_model is not None else None,
         ),
         axis_name="batch",
         donate_argnums=(0,),   # donate corr_state buffers; backbone/encoder params are kept
@@ -416,8 +443,12 @@ def run_training(config):
             batch = {k: v for k, v in batch.items() if isinstance(v, (np.ndarray, jnp.ndarray))}
             batch = shard(batch)
 
+            # Only pass cnp_params when actually used — pmap would otherwise try to
+            # map over axis 0 of a bare `None` and fail (no `.shape` to map over).
+            extra_step_kwargs = {"cnp_params": frozen_cnp_params} if frozen_cnp_params is not None else {}
             corr_state, metrics = p_train_step(
                 corr_state, frozen_backbone_params, encoder_params, batch=batch,
+                **extra_step_kwargs,
             )
 
             if is_first_step:

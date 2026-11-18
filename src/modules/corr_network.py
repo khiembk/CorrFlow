@@ -203,6 +203,80 @@ def EmCorrNetwork_L(**kwargs): return EmCorrNetwork(hidden_dim=512, num_layers=4
 def EmCorrNetwork_XL(**kwargs): return EmCorrNetwork(hidden_dim=512, num_layers=4, **kwargs)
 
 
+class CNPPathNet(nn.Module):
+    """Conditional-Neural-Process-style, trainable alternative to the fixed GP/Clayton
+    noise-path constructions in sampling_utils.py.
+
+    Unlike those (hand-specified kernel -> posterior mean/variance), this network
+    *learns* a causal context encoder end-to-end, trained with its own auxiliary
+    objective: predict each token's clean embedding x0_i from the strictly-previous
+    tokens' embeddings x0_{<i} (standard teacher-forced autoregressive NLL — a
+    well-posed objective since x0 is real data, unlike the latent noise path itself).
+
+    The predicted uncertainty (log_sigma_i) is then repurposed as a *learned,
+    per-token, data-dependent* AR(1) correlation strength: tokens the network finds
+    highly predictable (low sigma) get strongly-correlated injected noise; tokens
+    it finds surprising (high sigma) get noise close to independent. This replaces
+    the GP's fixed distance/kernel-based correlation strength with one driven by
+    the actual local predictability of the text.
+
+    Reuses CausalConvBlock from CorrNetwork (same architecture family) with the
+    AdaLN gamma/beta fixed at zero (no time-conditioning needed here — this network
+    only ever looks at x0, not the flow-matching timestep).
+    """
+    hidden_dim: int = 128
+    num_layers: int = 2
+    gp_q: int = 4
+    log_sigma_min: float = -5.0
+    log_sigma_max: float = 5.0
+
+    @nn.compact
+    def __call__(self, x0):
+        # x0: (B, L, d) clean embeddings.
+        B, L, d = x0.shape
+
+        # Causal shift: position i's input is x0_{i-1} (zero-padded at i=0), so the
+        # network can never see x0_i itself before predicting it.
+        x0_shifted = jnp.concatenate(
+            [jnp.zeros((B, 1, d), dtype=x0.dtype), x0[:, :-1, :]], axis=1,
+        )
+
+        x = nn.Dense(
+            self.hidden_dim, use_bias=True,
+            kernel_init=DEFAULT_KERNEL_INIT, bias_init=DEFAULT_BIAS_INIT,
+            name='in_proj',
+        )(x0_shifted)
+
+        zero_cond = jnp.zeros((B, self.hidden_dim), dtype=x0.dtype)
+        for i in range(self.num_layers):
+            x = CausalConvBlock(
+                hidden_dim=self.hidden_dim, gp_q=self.gp_q, name=f'block_{i}',
+            )(x, zero_cond, zero_cond)
+
+        x = RMSNorm(self.hidden_dim, name='norm_out')(x)
+        mu = nn.Dense(
+            d, use_bias=True, kernel_init=DEFAULT_KERNEL_INIT, bias_init=DEFAULT_BIAS_INIT,
+            name='mu_proj',
+        )(x)
+        log_sigma = nn.Dense(
+            d, use_bias=True, kernel_init=DEFAULT_KERNEL_INIT, bias_init=ZERO_INIT,
+            name='log_sigma_proj',
+        )(x)
+        log_sigma = jnp.clip(log_sigma, self.log_sigma_min, self.log_sigma_max)
+
+        return mu, log_sigma
+
+
+def CNPPathNet_S(**kwargs): return CNPPathNet(hidden_dim=128, num_layers=2, **kwargs)
+def CNPPathNet_M(**kwargs): return CNPPathNet(hidden_dim=256, num_layers=2, **kwargs)
+
+
+CNPPathNet_models = {
+    'CNPPathNet-S': CNPPathNet_S,
+    'CNPPathNet-M': CNPPathNet_M,
+}
+
+
 CorrNetwork_models = {
     'CorrNet-S':    CorrNetwork_S,
     'CorrNet-M':    CorrNetwork_M,

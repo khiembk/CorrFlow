@@ -17,12 +17,12 @@ from utils.checkpoint_utils import upload_output_dir_to_hf
 from utils.train_utils import TrainState
 from configs.config import Config, SamplingConfig
 
-from utils.metrics_utils import Metrics as PPLMetrics, compute_bleu, compute_rouge
+from utils.metrics_utils import Metrics as PPLMetrics, compute_bleu, compute_rouge, compute_rep_n, compute_mauve
 from jax.experimental.multihost_utils import sync_global_devices
-from utils.data_utils import get_dataloader, get_pad_token_id
+from utils.data_utils import get_dataloader, get_pad_token_id, load_dataset_split
 from utils.encoder_utils import encode_text
 from utils.generation_utils import (
-    mask_after_eos, shift_left,
+    mask_after_eos, truncate_to_first_sentence, shift_left,
     _setup_generation, _make_pmap_pair, _shard_timesteps, _shard_noise,
     _build_run_name,
 )
@@ -133,6 +133,21 @@ def test_generation_uncond(
             eval_context_size=config.eval_ppl_max_length,
         )
 
+    reference_texts = None
+    if config.eval_mauve and jax.process_index() == 0:
+        ref_path = config.eval_data_path or config.data_path
+        log_for_0(f"MAUVE: loading reference text sample from {ref_path}...")
+        ref_dataset = load_dataset_split(ref_path)
+        ref_indices = range(min(num_samples, len(ref_dataset)))
+        reference_texts = []
+        for idx in ref_indices:
+            row = ref_dataset[idx]
+            seq_len = int(row["sequence_length"])
+            ids = np.asarray(row["input_ids"])[:seq_len]
+            reference_texts.append(tokenizer.decode(ids, skip_special_tokens=True))
+        reference_texts = [t for t in reference_texts if t.strip()]
+        log_for_0(f"MAUVE: loaded {len(reference_texts)} reference texts")
+
     for num_sampling_steps, cfg_scale, self_cond_cfg_scale in itertools.product(
         steps_list, cfg_list, self_cond_cfg_scales_list
     ):
@@ -162,6 +177,9 @@ def test_generation_uncond(
             batch_rng = jax.random.fold_in(rng, batch_idx * jax.process_count() + jax.process_index())
             noise_rng, t_rng = jax.random.split(batch_rng)
             device_rngs = jax.random.split(noise_rng, num_local_devices)
+            # Independent fold-in (doesn't consume noise_rng/t_rng) so behavior when
+            # config.addnoise=False is byte-identical to before this was added.
+            decode_device_rngs = jax.random.split(jax.random.fold_in(batch_rng, 999), num_local_devices)
 
             t_steps_sharded = _shard_timesteps(
                 t_rng, num_local_devices, num_sampling_steps, time_schedule, config,
@@ -184,6 +202,7 @@ def test_generation_uncond(
             t_final_sharded = t_steps_sharded[:, -1]
             predicted_ids_sharded = p_decode_ids(
                 z=latent_sharded, model_params=model_params_replicated, t_final_val=t_final_sharded,
+                decode_rng=decode_device_rngs,
             )
             predicted_ids_sharded.block_until_ready()
             decode_time += time.time() - dec_start
@@ -195,6 +214,8 @@ def test_generation_uncond(
                 if samples_processed >= num_samples:
                     break
                 text = tokenizer.decode(np.array(predicted_ids[i]), skip_special_tokens=True)
+                if config.gen_truncate_to_first_sentence:
+                    text = truncate_to_first_sentence(text)
                 all_generated.append((samples_processed, text))
                 samples_processed += 1
 
@@ -252,13 +273,40 @@ def test_generation_uncond(
 
         sync_global_devices("after_ppl")
 
+        mauve_rep_results = None
+        if config.eval_mauve and jax.process_index() == 0:
+            with open(out_path, "r", encoding="utf-8") as f:
+                text_samples = [json.loads(line)["generated"] for line in f]
+            nonempty_samples = [s for s in text_samples if isinstance(s, str) and s.strip()]
+            if not nonempty_samples:
+                log_for_0("MAUVE/REP-4 eval: all samples empty; skipping")
+            else:
+                log_for_0("\n" + "=" * 70)
+                log_for_0("              MAUVE / REP-4 EVALUATION (rank 0 only)")
+                log_for_0("=" * 70)
+                mauve_rep_results = compute_rep_n(nonempty_samples, n=4)
+                if reference_texts:
+                    mauve_rep_results.update(compute_mauve(
+                        generated_texts=nonempty_samples,
+                        reference_texts=reference_texts,
+                        featurize_model_name=config.eval_mauve_featurize_model,
+                        device_id=config.eval_mauve_device_id,
+                    ))
+                else:
+                    mauve_rep_results["mauve"] = float("nan")
+                log_for_0(f"MAUVE: {mauve_rep_results['mauve']:.4f}")
+                log_for_0(f"REP-4: {mauve_rep_results['rep4']:.4f}")
+                log_for_0("=" * 70 + "\n")
+
         if jax.process_index() == 0:
-            if ppl_results is not None:
-                mean_ppl = ppl_results["ppl"]
-                metrics_line = {
-                    "epoch": epoch_val, "step": step_val,
-                    "ppl": mean_ppl, "mean_entropy": ppl_results["mean_entropy"],
-                }
+            if ppl_results is not None or mauve_rep_results is not None:
+                metrics_line = {"epoch": epoch_val, "step": step_val}
+                if ppl_results is not None:
+                    metrics_line["ppl"] = ppl_results["ppl"]
+                    metrics_line["mean_entropy"] = ppl_results["mean_entropy"]
+                if mauve_rep_results is not None:
+                    metrics_line["mauve"] = mauve_rep_results["mauve"]
+                    metrics_line["rep4"] = mauve_rep_results["rep4"]
                 with open(os.path.join(config.output_dir, name, "metrics.jsonl"), "a", encoding="utf-8") as f:
                     f.write(json.dumps(metrics_line, ensure_ascii=False) + "\n")
                 upload_output_dir_to_hf(config.output_dir, config.hf_repo_id, reason="generation metrics")
@@ -272,6 +320,11 @@ def test_generation_uncond(
                     wandb_tables.update({
                         f"generation/{name}/ppl": mean_ppl,
                         f"generation/{name}/mean_entropy": ppl_results["mean_entropy"],
+                    })
+                if mauve_rep_results is not None:
+                    wandb_tables.update({
+                        f"generation/{name}/mauve": mauve_rep_results["mauve"],
+                        f"generation/{name}/rep4": mauve_rep_results["rep4"],
                     })
 
     if jax.process_index() == 0 and config.use_wandb and wandb_tables:
@@ -379,6 +432,9 @@ def test_generation_cond(
             batch_rng = jax.random.fold_in(rng, batch_idx * jax.process_count() + jax.process_index())
             noise_rng, t_rng = jax.random.split(batch_rng)
             device_rngs = jax.random.split(noise_rng, num_local_devices)
+            # Independent fold-in (doesn't consume noise_rng/t_rng) so behavior when
+            # config.addnoise=False is byte-identical to before this was added.
+            decode_device_rngs = jax.random.split(jax.random.fold_in(batch_rng, 999), num_local_devices)
 
             t_steps_sharded = _shard_timesteps(
                 t_rng, num_local_devices, num_sampling_steps, time_schedule, config,
@@ -424,6 +480,7 @@ def test_generation_cond(
             t_final_sharded = t_steps_sharded[:, -1]
             predicted_ids_sharded = p_decode_ids(
                 z=latent_sharded, model_params=model_params_replicated, t_final_val=t_final_sharded,
+                decode_rng=decode_device_rngs,
             )
             predicted_ids_sharded.block_until_ready()
             predicted_ids = predicted_ids_sharded.reshape(-1, predicted_ids_sharded.shape[-1])

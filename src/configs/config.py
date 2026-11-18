@@ -71,6 +71,20 @@ class Config:
     gp_obs_noise: float = 1.0       # GP observation noise; set to ~observation variance (ε*σ has var~4)
     gp_jitter: float = 1e-5         # Numerical jitter (all diagonal entries)
 
+    # Clayton copula path — JAX training (use_clayton_gp=True)
+    # Markov (first-order) causal chain; gp_q is accepted but unused (parity only).
+    use_clayton_gp: bool = False
+    clayton_theta: float = 1.0      # Clayton dependence parameter (> 0; larger = stronger lower-tail dependence)
+
+    # CNP path — JAX training (use_cnp_gp=True). Trainable alternative to the fixed
+    # GP/Clayton paths: a small causal network predicts per-token correlation
+    # strength from the real embeddings' own local predictability, trained jointly
+    # with CorrNetwork via an auxiliary NLL loss (weighted by cnp_loss_weight).
+    use_cnp_gp: bool = False
+    cnp_model: str = 'CNPPathNet-S'  # CNPPathNet-S (h=128), CNPPathNet-M (h=256)
+    cnp_checkpoint: str = None       # path to a pretrain_cnp.py output dir (frozen, phase-1 pretrained)
+    cnp_loss_weight: float = 1.0     # unused in the two-phase (frozen-CNP) design; kept for parity
+
     # PDE-inspired GP path — JAX training (use_pde_gp=True)
     use_pde_gp: bool = False
     pde_time_scale: float = 1.0         # τ: time-dimension weight in GP distance
@@ -133,12 +147,34 @@ class Config:
     # Sampling configs sweep (list of SamplingConfig objects, loaded from YAML)
     sampling_configs: list = [SamplingConfig()]
     num_samples: int = 100
+    # Decode-time noise (optional): perturb the final latent before decoding to
+    # slightly increase output entropy/diversity. Off by default — no effect on
+    # existing behavior/results unless explicitly enabled.
+    addnoise: bool = False
+    addnoise_scale: float = 0.02  # Std of the Gaussian noise added when addnoise=True
 
     # PPL Evaluation
     online_eval: bool = True  # Enable PPL evaluation for generated samples
     eval_ppl_model: str = "gpt2-large"  # Model for PPL evaluation
     eval_ppl_batch_size: int = 64  # Batch size for PPL evaluation (adjusted to be divisible by device count)
     eval_ppl_max_length: int = 1024  # Max sequence length for PPL evaluation
+
+    # MAUVE / REP-n (unconditional generation only; opt-in, off by default)
+    eval_mauve: bool = False  # Also compute MAUVE (vs. a real-text reference sample) and REP-4
+    eval_mauve_featurize_model: str = "gpt2-large"  # Featurizer for MAUVE's GPT-2 embeddings
+    eval_mauve_device_id: int = 0  # torch device index for MAUVE featurization (-1 = CPU)
+
+    # First-sentence truncation for unconditional generation (opt-in, off by default).
+    # LM1B's preprocessing never appends an EOS token (add_special_tokens=False), so
+    # the decoder CE loss never trains the model to terminate: generation runs to
+    # max_length, producing several real-looking sentences concatenated into one
+    # run-on blob instead of LM1B's single-sentence examples. Random length-matched
+    # truncation does NOT fix this (verified empirically: MAUVE stayed at ~0.007,
+    # same as the untruncated run, because a random cut still lands mid-clause).
+    # Cutting at the first sentence boundary does fix it (MAUVE 0.0097 -> 0.095 in
+    # the same test) since the model's first embedded sentence is usually well-formed
+    # on its own. Requires nltk's punkt tokenizer.
+    gen_truncate_to_first_sentence: bool = False
 
     # Logging & Checkpointing
     log_freq: int = 100

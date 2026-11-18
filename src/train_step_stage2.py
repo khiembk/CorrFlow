@@ -27,7 +27,7 @@ from utils.train_utils import TrainState
 from utils.encoder_utils import encode_text
 from utils.sampling_utils import (
     sample_timesteps, sample_gp_path, sample_gp_path_correlation,
-    sample_pde_gp_path, net_out_to_v_x,
+    sample_pde_gp_path, sample_clayton_gp_path, sample_cnp_path, net_out_to_v_x,
 )
 
 
@@ -42,6 +42,8 @@ def train_step_stage2(
     encoder_apply_fn,
     batch: Dict[str, Array],
     config,
+    cnp_params: Dict = None,
+    cnp_apply_fn=None,
 ) -> Tuple[TrainState, Dict[str, float]]:
     """Perform a single Stage 2 training step (correlation network only).
 
@@ -99,7 +101,24 @@ def train_step_stage2(
 
     noise = jax.random.normal(noise_rng, x0.shape, dtype=x0.dtype)  # (B, L, d)
 
-    if getattr(config, 'use_pde_gp', False):
+    if getattr(config, 'use_cnp_gp', False):
+        z_gp, v_gp, _, _ = sample_cnp_path(
+            cnp_apply_fn, cnp_params,
+            x0, noise, t,
+            noise_scale=config.denoiser_noise_scale,
+            cond_seq_mask=cond_seq_mask,
+            split_at=getattr(config, 'max_input_length', None),
+        )
+    elif getattr(config, 'use_clayton_gp', False):
+        z_gp, v_gp, _ = sample_clayton_gp_path(
+            x0, noise, t,
+            gp_q=config.gp_q,
+            clayton_theta=getattr(config, 'clayton_theta', 1.0),
+            noise_scale=config.denoiser_noise_scale,
+            cond_seq_mask=cond_seq_mask,
+            split_at=getattr(config, 'max_input_length', None),
+        )
+    elif getattr(config, 'use_pde_gp', False):
         z_gp, v_gp, _ = sample_pde_gp_path(
             x0, noise, t,
             gp_q=config.gp_q,

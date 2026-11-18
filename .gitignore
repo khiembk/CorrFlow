@@ -29,6 +29,9 @@ data/
 # Wandb
 wandb/
 
+# Run logs
+src/logs/*.log
+
 # OS / editor
 .DS_Store
 *.swp

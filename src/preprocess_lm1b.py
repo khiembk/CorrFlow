@@ -27,6 +27,9 @@ if REPO_ROOT not in sys.path:
 
 
 def tokenize_shard(shard_path, tokenizer, max_length):
+    """Tokenize and append EOS so the dataloader's attention_mask covers the
+    stop position — without it, the decoder CE loss never sees a "terminate
+    here" target and generation never learns to emit EOS (runs to max_length)."""
     input_ids_list, seq_len_list = [], []
     with open(shard_path, "r", encoding="utf-8") as f:
         lines = [l.strip() for l in f if l.strip()]
@@ -37,13 +40,13 @@ def tokenize_shard(shard_path, tokenizer, max_length):
             batch,
             add_special_tokens=False,
             truncation=True,
-            max_length=max_length,
+            max_length=max_length - 1,
             padding=False,
         )
         for ids in enc["input_ids"]:
             if len(ids) == 0:
                 continue
-            ids_arr = np.array(ids, dtype=np.int32)
+            ids_arr = np.array(ids + [tokenizer.eos_token_id], dtype=np.int32)
             input_ids_list.append(ids_arr)
             seq_len_list.append(len(ids_arr))
     return input_ids_list, seq_len_list

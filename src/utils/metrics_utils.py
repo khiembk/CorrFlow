@@ -28,6 +28,56 @@ def compute_bleu(hypotheses, references):
     return sacrebleu.corpus_bleu(hypotheses, [references], lowercase=True, use_effective_order=True).score
 
 
+def compute_rep_n(texts: List[str], n: int = 4) -> Dict:
+    """REP-n: fraction of repeated n-grams, averaged over samples (Welleck et al. 2020).
+
+    rep_n(x) = 100 * (1 - |unique n-grams(x)| / |total n-grams(x)|). Word-level
+    n-grams on whitespace tokenization; samples with fewer than n words are skipped.
+    """
+    per_sample = []
+    for text in texts:
+        words = text.split()
+        if len(words) < n:
+            continue
+        ngrams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+        if not ngrams:
+            continue
+        rep = 100.0 * (1.0 - len(set(ngrams)) / len(ngrams))
+        per_sample.append(rep)
+    mean, std, sem = _mean_std_sem(per_sample) if per_sample else (float("nan"), 0.0, 0.0)
+    return {f"rep{n}": mean, f"rep{n}_std": std, f"rep{n}_sem": sem}
+
+
+def compute_mauve(
+    generated_texts: List[str],
+    reference_texts: List[str],
+    featurize_model_name: str = "gpt2-large",
+    device_id: int = -1,
+    max_text_length: int = 1024,
+    verbose: bool = False,
+) -> Dict:
+    """MAUVE score (Pillutla et al. 2021) between generated and reference text.
+
+    Compares the generated-text distribution to a reference (real-text) sample via
+    GPT-2 embeddings + divergence-frontier estimation. Runs on CPU by default
+    (device_id=-1) since this JAX project's torch install has no CUDA backend.
+    """
+    import mauve as mauve_lib
+
+    n = min(len(generated_texts), len(reference_texts))
+    if n < 2:
+        return {"mauve": float("nan")}
+    out = mauve_lib.compute_mauve(
+        p_text=reference_texts[:n],
+        q_text=generated_texts[:n],
+        featurize_model_name=featurize_model_name,
+        device_id=device_id,
+        max_text_length=max_text_length,
+        verbose=verbose,
+    )
+    return {"mauve": float(out.mauve)}
+
+
 def compute_rouge(hypotheses, references, return_std=False):
     from rouge_score import rouge_scorer
     scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)

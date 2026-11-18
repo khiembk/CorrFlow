@@ -27,6 +27,24 @@ def mask_after_eos(predicted_ids, eos_token_id, pad_token_id):
     return jnp.where(keep_mask, predicted_ids, pad_token_id)
 
 
+def truncate_to_first_sentence(text):
+    """Keep only the first sentence of generated text.
+
+    Mitigates backbones with no learned stopping signal (e.g. LM1B, whose
+    preprocessing never appends an EOS token so the decoder CE loss never
+    trains termination): generation runs to max_length and produces several
+    real-looking sentences concatenated together. The first one is usually
+    well-formed on its own, so cutting there recovers LM1B's single-sentence
+    structure without needing to retrain the backbone.
+    """
+    from nltk.tokenize import sent_tokenize
+    text = text.strip()
+    if not text:
+        return text
+    sentences = sent_tokenize(text)
+    return sentences[0].strip() if sentences else text
+
+
 def shift_left(x, shift_per_sample, pad_value=0, axis=1):
     """Shift each sample left along the sequence axis; pad emptied positions."""
     if x.ndim < 2:
@@ -141,9 +159,17 @@ def _generate_samples_single_batch(
     return z
 
 
-def _dlm_decode_batch(z, model_params, model_apply_fn, t_final_val, config, self_cond_cfg_scale):
-    """Decode z→tokens with the DLM decoder head."""
+def _dlm_decode_batch(z, model_params, model_apply_fn, t_final_val, config, self_cond_cfg_scale, decode_rng=None):
+    """Decode z→tokens with the DLM decoder head.
+
+    If config.addnoise is True, a small amount of Gaussian noise (std=config.addnoise_scale)
+    is added to z right before decoding, which perturbs the argmax token choice slightly and
+    increases output entropy/diversity. Disabled by default (addnoise=False), in which case
+    decoding is exactly as before.
+    """
     batch_size = z.shape[0]
+    if config.addnoise:
+        z = z + config.addnoise_scale * jax.random.normal(decode_rng, z.shape, dtype=z.dtype)
     t_final = jnp.full((batch_size,), t_final_val, dtype=z.dtype)
     self_cond_cfg_scale_batch = (
         jnp.full((batch_size,), self_cond_cfg_scale, dtype=z.dtype)

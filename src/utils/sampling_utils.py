@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 from jax import Array
+from jax.scipy.special import ndtr, ndtri
 
 
 # ============================================
@@ -484,6 +485,198 @@ def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
         z_gp = cond_seq_mask * x0 + (1 - cond_seq_mask) * z_gp
 
     return z_gp, v_gp, eps_gp
+
+# ============================================
+# Clayton Copula Path (Stage 2: asymmetric lower-tail-dependent correlation)
+# ============================================
+
+def sample_clayton_gp_path(x0, noise, t, gp_q, clayton_theta, noise_scale=1.0,
+                            cond_seq_mask=None, split_at=None, eps=1e-6):
+    """Causal Clayton-copula noise path: an asymmetric-dependence alternative to
+    the Gaussian GP noise-path (sample_gp_path).
+
+    Unlike a GP (jointly Gaussian: dependence and marginals both Gaussian), a copula
+    decouples the two — here the marginal stays standard normal, but token-to-token
+    dependence follows a Clayton copula, which has *lower-tail dependence*: tokens
+    are weakly coupled in general but can co-move strongly in the negative tail,
+    something a Gaussian kernel cannot express regardless of lengthscale/rho.
+
+    Clayton (and other Archimedean copulas) only has a closed-form *multivariate*
+    conditional sampler via a shared-frailty (Marshall-Olkin) construction, which is
+    exchangeable, not causal — it cannot condition on an arbitrary-size causal window
+    the way the GP kernels here do. The tractable causal construction is the
+    first-order (Markov) chain, via the closed-form bivariate Clayton conditional
+    inverse CDF:
+
+        v_i = [ (w_i^{-theta/(theta+1)} - 1) * u_{i-1}^{-theta} + 1 ]^{-1/theta}
+
+    where w_i ~ Uniform(0,1) fresh per token/dim, u_{i-1} = Phi(eps_{i-1}) is the
+    previous token's copula-uniform state, and v_i ~ Uniform(0,1) marginally but
+    Clayton-dependent on u_{i-1}. Mapping back through the inverse normal CDF gives
+    a standard-normal eps_i with the desired asymmetric dependence:
+
+        eps_i = Phi^{-1}(v_i)
+
+    This directly parallels sample_gp_path's gp_kernel='exponential' case, which is
+    also Markov regardless of gp_q (see _gp_tables docstring) — gp_q is accepted
+    here only for interface parity with the other GP path functions and is unused.
+
+    Applied independently per embedding dimension (same w_i/u_i recursion run in
+    parallel across all d channels).
+
+    Args:
+        x0:            (B, L, d) clean embeddings.
+        noise:         (B, L, d) i.i.d. N(0,I) innovation noise (its CDF supplies
+                       the fresh per-step uniform w_i via Phi(noise), so the whole
+                       construction stays reparameterizable/differentiable).
+        t:             (B,) timesteps in [0, 1].
+        gp_q:          unused (kept for interface parity with sample_gp_path).
+        clayton_theta: float > 0, Clayton dependence parameter. theta -> 0 gives
+                       independence; larger theta gives stronger lower-tail
+                       dependence. Must be > 0 (Clayton is undefined at theta=0,
+                       which is the independence copula's limit).
+        noise_scale:   Global noise scale (matches denoiser_noise_scale).
+        cond_seq_mask: Optional (B, L, 1) mask — cond tokens pinned to clean x0.
+        split_at:      Optional int — reset the copula chain at this position
+                       (bilingual source|target boundary, as in sample_gp_path).
+        eps:           numerical floor for the uniform values (avoids 0/1 blowups
+                       in the (.)^{-theta} terms).
+
+    Returns:
+        z_gp:   (B, L, d) path latent at time t.
+        v_gp:   (B, L, d) velocity target (= x0 - eps_gp * noise_scale).
+        eps_gp: (B, L, d) Clayton-copula-correlated effective noise.
+    """
+    B, L, d = x0.shape
+    theta = jnp.float32(clayton_theta)
+
+    def _clayton_cond_inv(w, u):
+        """Bivariate Clayton conditional inverse CDF: draw v | u from a fresh w."""
+        w = jnp.clip(w, eps, 1.0 - eps)
+        u = jnp.clip(u, eps, 1.0 - eps)
+        inner = (w ** (-theta / (theta + 1.0)) - 1.0) * (u ** (-theta)) + 1.0
+        inner = jnp.maximum(inner, eps)
+        return inner ** (-1.0 / theta)
+
+    def step_fn(carry, inputs):
+        u_prev, active = carry           # u_prev: (B, d) copula-uniform state
+        noise_i, = inputs                # (B, d)
+
+        w_i = jnp.clip(ndtr(noise_i), eps, 1.0 - eps)   # fresh per-step uniform
+
+        v_i_dep = _clayton_cond_inv(w_i, u_prev)
+        # First token (no context yet): fall back to the raw uniform (independence).
+        v_i = jnp.where(active, v_i_dep, w_i)
+        eps_i = ndtri(jnp.clip(v_i, eps, 1.0 - eps))
+
+        new_active = jnp.ones_like(active)
+        return (v_i, new_active), eps_i
+
+    noise_T = noise.transpose(1, 0, 2)  # (L, B, d)
+
+    def _run_scan(xs):
+        init_carry = (
+            jnp.full((B, d), 0.5, dtype=jnp.float32),   # u_prev (unused at step 0)
+            jnp.zeros((B, d), dtype=jnp.bool_),         # active
+        )
+        _, eps_out = jax.lax.scan(step_fn, init_carry, (xs,))
+        return eps_out
+
+    if split_at is not None:
+        eps_src_T = _run_scan(noise_T[:split_at])
+        eps_tgt_T = _run_scan(noise_T[split_at:])
+        eps_gp = jnp.concatenate([eps_src_T, eps_tgt_T], axis=0).transpose(1, 0, 2)
+    else:
+        eps_gp_T = _run_scan(noise_T)
+        eps_gp = eps_gp_T.transpose(1, 0, 2)  # (B, L, d)
+
+    t_e = t.reshape(-1, 1, 1)
+    z_gp = t_e * x0 + (1 - t_e) * eps_gp * noise_scale
+    v_gp = x0 - eps_gp * noise_scale
+
+    if cond_seq_mask is not None:
+        z_gp = cond_seq_mask * x0 + (1 - cond_seq_mask) * z_gp
+
+    return z_gp, v_gp, eps_gp
+
+
+# ============================================
+# CNP Path (Stage 2: learned, data-dependent correlation strength)
+# ============================================
+
+def sample_cnp_path(cnp_apply_fn, cnp_params, x0, noise, t, noise_scale=1.0,
+                     cond_seq_mask=None, split_at=None):
+    """Trainable alternative to the fixed GP/Clayton noise paths: a CNPPathNet
+    predicts (mu_i, log_sigma_i) for x0_i from the strictly-causal context
+    x0_{<i}, trained via its own NLL term. log_sigma_i is converted into a
+    per-token AR(1) correlation strength rho_i = sigmoid(-log_sigma_i): tokens
+    the network finds highly predictable (low sigma) get strongly-correlated
+    noise; surprising tokens (high sigma) get noise closer to independent.
+
+    This is a genuinely learned analogue of the GP path functions' job, in that
+    rho_i is driven by the actual local predictability of the real embeddings
+    rather than a fixed kernel of token distance.
+
+    Returns:
+        z_gp:           (B, L, d) path latent at time t.
+        v_gp:           (B, L, d) velocity target (= x0 - eps_gp * noise_scale).
+        eps_gp:         (B, L, d) CNP-correlated effective noise.
+        per_token_nll:  (B, L) CNPPathNet's own auxiliary NLL loss per token
+                        (caller must mask-reduce this the same way as the main
+                        L_con loss, and add lambda * mean(per_token_nll) to the
+                        total loss so the path net actually trains).
+    """
+    B, L, d = x0.shape
+
+    mu, log_sigma = cnp_apply_fn({"params": cnp_params}, x0)   # each (B, L, d)
+    sigma = jnp.exp(log_sigma)
+
+    # Gaussian NLL (per-dim, averaged over d) for the auxiliary context-prediction loss.
+    per_dim_nll = 0.5 * ((x0 - mu) / sigma) ** 2 + log_sigma
+    per_token_nll = jnp.mean(per_dim_nll, axis=-1)  # (B, L)
+
+    # Per-token, per-dim AR(1) correlation strength from predicted uncertainty.
+    rho = jax.nn.sigmoid(-log_sigma)
+    rho = jnp.clip(rho, 0.0, 0.995)  # numerical safety margin
+
+    def step_fn(carry, inputs):
+        eps_prev, active = carry           # eps_prev: (B, d)
+        noise_i, rho_i = inputs            # (B, d) each
+
+        eps_dep = rho_i * eps_prev + jnp.sqrt(1.0 - rho_i ** 2) * noise_i
+        eps_i = jnp.where(active, eps_dep, noise_i)  # token 0: pure i.i.d. noise
+
+        new_active = jnp.ones_like(active)
+        return (eps_i, new_active), eps_i
+
+    noise_T = noise.transpose(1, 0, 2)  # (L, B, d)
+    rho_T = rho.transpose(1, 0, 2)       # (L, B, d)
+
+    def _run_scan(noise_xs, rho_xs):
+        init_carry = (
+            jnp.zeros((B, d), dtype=x0.dtype),
+            jnp.zeros((B, d), dtype=jnp.bool_),
+        )
+        _, eps_out = jax.lax.scan(step_fn, init_carry, (noise_xs, rho_xs))
+        return eps_out
+
+    if split_at is not None:
+        eps_src_T = _run_scan(noise_T[:split_at], rho_T[:split_at])
+        eps_tgt_T = _run_scan(noise_T[split_at:], rho_T[split_at:])
+        eps_gp = jnp.concatenate([eps_src_T, eps_tgt_T], axis=0).transpose(1, 0, 2)
+    else:
+        eps_gp_T = _run_scan(noise_T, rho_T)
+        eps_gp = eps_gp_T.transpose(1, 0, 2)  # (B, L, d)
+
+    t_e = t.reshape(-1, 1, 1)
+    z_gp = t_e * x0 + (1 - t_e) * eps_gp * noise_scale
+    v_gp = x0 - eps_gp * noise_scale
+
+    if cond_seq_mask is not None:
+        z_gp = cond_seq_mask * x0 + (1 - cond_seq_mask) * z_gp
+
+    return z_gp, v_gp, eps_gp, per_token_nll
+
 
 # ============================================
 # Stage 2 — conditional velocity wrapper
