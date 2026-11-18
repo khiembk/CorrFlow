@@ -116,6 +116,7 @@ def test_generation_uncond(
             d_model=d_model,
             t_eps=config.t_eps,
             use_z_input=use_z_input,
+            corr_strength=config.corr_strength,
         )
 
     pad_token_id = get_pad_token_id(tokenizer)
@@ -369,6 +370,7 @@ def test_generation_cond(
             d_model=d_model,
             t_eps=config.t_eps,
             use_z_input=use_z_input,
+            corr_strength=config.corr_strength,
         )
 
     encode_latent_mean, encode_latent_std = config.latent_mean, config.latent_std

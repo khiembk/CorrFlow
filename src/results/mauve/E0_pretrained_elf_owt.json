@@ -1,0 +1,12 @@
+[
+  {
+    "K": 1024,
+    "mode": "a",
+    "ref_sampling": "first",
+    "mauve": 0.23692150474404458,
+    "gen_retention": 1.0,
+    "ref_retention": 1.0,
+    "gen_n": 1000,
+    "ref_n": 1000
+  }
+]

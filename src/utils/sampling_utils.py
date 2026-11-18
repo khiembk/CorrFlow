@@ -683,7 +683,7 @@ def sample_cnp_path(cnp_apply_fn, cnp_params, x0, noise, t, noise_scale=1.0,
 # ============================================
 
 def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_model, t_eps,
-                              use_z_input=False):
+                              use_z_input=False, corr_strength=1.0):
     """Return a drop-in backbone apply_fn that adds the CorrNetwork velocity correction.
 
     During ODE/SDE sampling the caller does:
@@ -692,8 +692,8 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
 
     We replace x_pred with x_pred_modified so that net_out_to_v_x yields v_con:
         v_ind  = (x_pred - z) / max(1-t, t_eps)
-        v_con  = v_ind + phi_eta(v_ind, t)            [CorrNet]
-              or v_ind + phi_eta(v_ind, z, t)          [EmCorrNet, use_z_input=True]
+        v_con  = v_ind + corr_strength * phi_eta(v_ind, t)            [CorrNet]
+              or v_ind + corr_strength * phi_eta(v_ind, z, t)          [EmCorrNet, use_z_input=True]
         x_pred_modified = v_con * max(1-t, t_eps) + z
 
     The decode step uses only decoder_logits (the second element of the tuple) and
@@ -706,6 +706,10 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
     Args:
         use_z_input: if True, pass the current latent z as second positional arg to
                      corr_apply_fn (EmCorrNet signature: v_ind, z_t, t).
+        corr_strength: scales phi_eta's contribution to v_con. 1.0 (default) matches
+            training exactly. 0.0 recovers pure v_ind (Stage 1 backbone only); used to
+            isolate whether the correction network itself — independent of sampling
+            schedule — is responsible for reduced generation diversity.
     """
     def wrapped_apply_fn(params, z_input, t, **kwargs):
         net_out = backbone_apply_fn(params, z_input, t, **kwargs)
@@ -724,7 +728,7 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
             delta_v = corr_apply_fn({"params": corr_params}, v_ind, z, t)
         else:
             delta_v = corr_apply_fn({"params": corr_params}, v_ind, t)
-        v_con = v_ind + delta_v
+        v_con = v_ind + corr_strength * delta_v
         x_pred_modified = v_con * t_denom + z
 
         if decoder_logits is None:

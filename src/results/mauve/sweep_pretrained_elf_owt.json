@@ -1,0 +1,122 @@
+[
+  {
+    "K": 512,
+    "mode": "a",
+    "ref_sampling": "first",
+    "mauve": 0.9002523014695331,
+    "gen_retention": 1.0,
+    "ref_retention": 1.0,
+    "gen_n": 1000,
+    "ref_n": 1000
+  },
+  {
+    "K": 512,
+    "mode": "b",
+    "ref_sampling": "first",
+    "mauve": 0.8520589152777706,
+    "gen_retention": 1.0,
+    "ref_retention": 0.982,
+    "gen_n": 1000,
+    "ref_n": 982
+  },
+  {
+    "K": 768,
+    "mode": "a",
+    "ref_sampling": "first",
+    "mauve": 0.8344242679293565,
+    "gen_retention": 1.0,
+    "ref_retention": 1.0,
+    "gen_n": 1000,
+    "ref_n": 1000
+  },
+  {
+    "K": 768,
+    "mode": "b",
+    "ref_sampling": "first",
+    "mauve": 0.8922675683546581,
+    "gen_retention": 0.999,
+    "ref_retention": 0.911,
+    "gen_n": 999,
+    "ref_n": 911
+  },
+  {
+    "K": 1024,
+    "mode": "a",
+    "ref_sampling": "first",
+    "mauve": 0.23692150474404458,
+    "gen_retention": 1.0,
+    "ref_retention": 1.0,
+    "gen_n": 1000,
+    "ref_n": 1000
+  },
+  {
+    "K": 1024,
+    "mode": "b",
+    "ref_sampling": "first",
+    "mauve": 0.883095222281748,
+    "gen_retention": 0.01,
+    "ref_retention": 0.005,
+    "gen_n": 10,
+    "ref_n": 5
+  },
+  {
+    "K": 512,
+    "mode": "a",
+    "ref_sampling": "random",
+    "mauve": 0.8783914397356591,
+    "gen_retention": 1.0,
+    "ref_retention": 1.0,
+    "gen_n": 1000,
+    "ref_n": 1000
+  },
+  {
+    "K": 512,
+    "mode": "b",
+    "ref_sampling": "random",
+    "mauve": 0.8984301648758093,
+    "gen_retention": 1.0,
+    "ref_retention": 0.986,
+    "gen_n": 1000,
+    "ref_n": 986
+  },
+  {
+    "K": 768,
+    "mode": "a",
+    "ref_sampling": "random",
+    "mauve": 0.8873942434746134,
+    "gen_retention": 1.0,
+    "ref_retention": 1.0,
+    "gen_n": 1000,
+    "ref_n": 1000
+  },
+  {
+    "K": 768,
+    "mode": "b",
+    "ref_sampling": "random",
+    "mauve": 0.9470227455461181,
+    "gen_retention": 0.999,
+    "ref_retention": 0.89,
+    "gen_n": 999,
+    "ref_n": 890
+  },
+  {
+    "K": 1024,
+    "mode": "a",
+    "ref_sampling": "random",
+    "mauve": 0.41154439365831696,
+    "gen_retention": 1.0,
+    "ref_retention": 1.0,
+    "gen_n": 1000,
+    "ref_n": 1000
+  },
+  {
+    "K": 1024,
+    "mode": "b",
+    "ref_sampling": "random",
+    "mauve": 0.9983544482169311,
+    "gen_retention": 0.01,
+    "ref_retention": 0.002,
+    "gen_n": 10,
+    "ref_n": 2
+  }
+]

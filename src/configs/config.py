@@ -60,6 +60,13 @@ class Config:
     t_eps: float = 5e-2
     time_schedule: str = "logit_normal"  # 'logit_normal' or 'uniform'
 
+    # CorrNetwork correction strength at generation time (opt-in diagnostic, off by
+    # default). v_con = v_ind + corr_strength * phi_eta(...). 1.0 matches training
+    # exactly; sweeping toward 0.0 isolates whether phi_eta's correction itself (as
+    # opposed to the sampling schedule / sde_gamma) is responsible for reduced
+    # generation diversity relative to the frozen Stage 1 backbone.
+    corr_strength: float = 1.0
+
     # GP path (Stage 2: correlation-aware path)
     gp_q: int = 2             # Context window size: token i conditions on the previous gp_q tokens
     gp_rho: float = 0.5       # Adjacent-token correlation (noise-GP kernel denominator).

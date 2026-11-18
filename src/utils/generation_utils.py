@@ -27,6 +27,18 @@ def mask_after_eos(predicted_ids, eos_token_id, pad_token_id):
     return jnp.where(keep_mask, predicted_ids, pad_token_id)
 
 
+def _ensure_nltk_punkt():
+    """nltk (via rouge-score in requirements.txt) is always installed, but its
+    punkt tokenizer data is a separate runtime download — fetch it once if a
+    fresh environment doesn't already have it cached."""
+    import nltk
+    for resource in ("tokenizers/punkt", "tokenizers/punkt_tab"):
+        try:
+            nltk.data.find(resource)
+        except LookupError:
+            nltk.download(resource.split("/")[-1], quiet=True)
+
+
 def truncate_to_first_sentence(text):
     """Keep only the first sentence of generated text.
 
@@ -37,6 +49,7 @@ def truncate_to_first_sentence(text):
     well-formed on its own, so cutting there recovers LM1B's single-sentence
     structure without needing to retrain the backbone.
     """
+    _ensure_nltk_punkt()
     from nltk.tokenize import sent_tokenize
     text = text.strip()
     if not text:
