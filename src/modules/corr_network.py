@@ -22,7 +22,13 @@ from modules.layers import (
 
 
 class CausalConvBlock(nn.Module):
-    """AdaLN → causal depthwise conv (kernel=gp_q) → pointwise → silu → residual."""
+    """AdaLN → causal depthwise conv (kernel=gp_q) → pointwise → silu → residual.
+
+    gp_q=0 ablation: a kernel size of 0 is not a valid convolution, and zero
+    context is exactly what "no conv" means architecturally, so the depthwise
+    conv is skipped entirely — output[i] then depends only on input[i] itself
+    (pointwise-only block), matching the zero-context-window GP path target.
+    """
     hidden_dim: int
     gp_q: int
 
@@ -38,21 +44,22 @@ class CausalConvBlock(nn.Module):
         x = RMSNorm(self.hidden_dim, name='norm')(x)
         x = (1.0 + gamma[:, None, :]) * x + beta[:, None, :]
 
-        # Causal depthwise conv:
-        #   left-pad gp_q zeros so output[i] receives only input[i-gp_q : i].
-        #   padded shape (B, L+gp_q, h); VALID conv with kernel gp_q yields
-        #   (B, L+1, h); slice [:, :L, :] drops the extra trailing position.
-        x_pad = jnp.pad(x, [(0, 0), (self.gp_q, 0), (0, 0)])
-        x = nn.Conv(
-            features=self.hidden_dim,
-            kernel_size=(self.gp_q,),
-            padding='VALID',
-            feature_group_count=self.hidden_dim,   # depthwise: one filter per channel
-            use_bias=True,
-            kernel_init=DEFAULT_KERNEL_INIT,
-            bias_init=DEFAULT_BIAS_INIT,
-            name='dw_conv',
-        )(x_pad)[:, :L, :]
+        if self.gp_q > 0:
+            # Causal depthwise conv:
+            #   left-pad gp_q zeros so output[i] receives only input[i-gp_q : i].
+            #   padded shape (B, L+gp_q, h); VALID conv with kernel gp_q yields
+            #   (B, L+1, h); slice [:, :L, :] drops the extra trailing position.
+            x_pad = jnp.pad(x, [(0, 0), (self.gp_q, 0), (0, 0)])
+            x = nn.Conv(
+                features=self.hidden_dim,
+                kernel_size=(self.gp_q,),
+                padding='VALID',
+                feature_group_count=self.hidden_dim,   # depthwise: one filter per channel
+                use_bias=True,
+                kernel_init=DEFAULT_KERNEL_INIT,
+                bias_init=DEFAULT_BIAS_INIT,
+                name='dw_conv',
+            )(x_pad)[:, :L, :]
 
         # Pointwise channel mixing
         x = nn.Dense(

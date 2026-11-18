@@ -2,6 +2,8 @@
 src/outputs/
 outputs/
 checkpoints/
+third_party
+third_party/
 *.ckpt
 *.pkl
 *.safetensors

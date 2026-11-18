@@ -355,6 +355,22 @@ def sample_gp_path(x0, noise, t, gp_q, gp_rho, gp_kernel='rbf',
     """
     B, L, d = x0.shape
 
+    if gp_q == 0:
+        # Ablation: zero context window. Every token's c_i = min(i, 0) = 0,
+        # so the GP posterior degenerates to the prior (mu=0, sigma=1) at
+        # EVERY position, not just token 0 — eps_gp = noise identically, with
+        # no cross-token correlation at all. This exactly reduces the GP path
+        # to Stage 1's plain linear-OT path (v_gp == v_lin). Short-circuited
+        # here (skipping the scan) since a zero-length sliding buffer hits a
+        # shape-mismatch edge case in jax.lax.scan's carry.
+        eps_gp = noise
+        t_e = t.reshape(-1, 1, 1)
+        z_gp = t_e * x0 + (1 - t_e) * eps_gp * noise_scale
+        v_gp = x0 - eps_gp * noise_scale
+        if cond_seq_mask is not None:
+            z_gp = cond_seq_mask * x0 + (1 - cond_seq_mask) * z_gp
+        return z_gp, v_gp, eps_gp
+
     # ------------------------------------------------------------------ kernel
     # Autoregressive GP over interpolants z^i_t.
     #
