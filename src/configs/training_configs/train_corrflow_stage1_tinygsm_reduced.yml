@@ -1,0 +1,118 @@
+# Reduced-budget rebuttal variant of train_corrflow_stage1_tinygsm.yml.
+#
+# Single-GPU full-backbone training (unlike Stage 2's small CorrNetwork) OOMs
+# at the full recipe's global_batch_size=512 (and even at 64) with
+# max_length=512 -- 32 is the measured-working micro-batch on one H100.
+# grad_accum_steps=16 keeps the effective batch at 512, matching the full
+# recipe exactly (same batch-size-preserving reduction strategy already used
+# for this project's other rebuttal-timeline baselines: only the TOTAL STEP
+# COUNT is reduced, not the optimization dynamics).
+#
+# Eval cost reduction: the full recipe's eval (1,319 full-GSM8K-test samples
+# x 1,024 ODE/SDE sampling steps x 2 sampling configs) measured at ~4 hours
+# PER checkpoint -- infeasible to check more than once. num_samples=128 +
+# gsm_sampling_configs_reduced.yml (512 steps, half of the full recipe)
+# brings this to ~12 minutes per checkpoint (measured: 90s/16samples/1024steps
+# scales linearly), enabling a cheap 4-stage progression (500/1000/1500/2000
+# steps) instead of one single endpoint.
+#
+# Full recipe would be 11 epochs x 22,988 steps/epoch ~= 252,868 steps;
+# 2000 steps is <1% of that -- explicitly a reduced-budget probe, not a
+# claim of convergence. See train_corrflow_stage1_tinygsm.yml for the
+# full, un-reduced recipe.
+#
+# Run (4-stage sweep, same pattern as this session's other ablations):
+#   cd src
+#   for steps in 500 1000 1500 2000; do
+#     python train.py --config configs/training_configs/train_corrflow_stage1_tinygsm_reduced.yml \
+#       --config_override max_steps=$steps
+#   done
+
+# Dataset
+data_path: "embedded-language-flows/tinygsm_train_t5"
+eval_data_path: "embedded-language-flows/gsm8k_test_t5"
+max_length: 512
+max_input_length: 192
+pad_token: eos
+code_target: true
+exec_num_proc: 16
+exec_timeout: 10.0
+
+# Encoder (frozen T5-small, same as ELF paper)
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture (ELF-B, same as ELF paper default)
+model: ELF-B
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# GP path (Stage 2 settings; define here so a future Stage 2 config can inherit)
+gp_q: 2
+gp_rho: 0.5
+gp_kernel: rbf
+
+# CorrNetwork (Stage 2 only)
+corr_model: CorrNet-M
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 1.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+label_drop_prob: 0.1
+self_cond_prob: 0.5
+
+# Training -- effective batch 512 (32 x grad_accum 16), matching the full
+# recipe; warmup_steps reduced from 5000 to 200 since max_steps=2000 total
+# would otherwise spend its entire budget still warming up.
+epochs: 50
+max_steps: 2000
+global_batch_size: 32
+grad_accum_steps: 16
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 200
+warmup_epochs: -1
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling -- 512 steps (half of the full recipe) x 128 samples (vs the full
+# 1,319-problem GSM8K test set), ~12 min/checkpoint instead of ~4 hours.
+sampling_configs_path: "configs/sampling_configs/gsm_sampling_configs_reduced.yml"
+num_samples: 128
+generation_batch_size: 32
+
+# Logging & Checkpointing
+log_freq: 50
+save_freq: 1
+eval_freq: 1
+
+# Output
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/corrflow_baselines/outputs/tinygsm_reduced/corrflow_stage1_tinygsm_reduced"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: false
+wandb_project: corrflow
+wandb_entity: null
+wandb_run_name: corrflow_stage1_tinygsm_reduced
+
+# Misc
+seed: 42

@@ -1,0 +1,18 @@
+# Reduced-budget variant of gsm_sampling_configs.yml for a rebuttal-timeline
+# TinyGSM run: 512 sampling steps (half of the full recipe's 1024) -- same
+# CFG/gamma/time_schedule otherwise. Paired with --config_override
+# num_samples=128 (vs the full GSM8K test set's 1319) keeps each eval
+# checkpoint to ~12 minutes instead of ~4 hours (measured: 90s per 16
+# samples at 1024 steps per sampling config).
+- sampling_method: ode
+  num_sampling_steps: [512]
+  cfgs: [2.5]
+  self_cond_cfg_scales: [1]
+  time_schedule: logit_normal
+
+- sampling_method: sde
+  num_sampling_steps: [512]
+  cfgs: [2.5]
+  sde_gamma: 0.2
+  self_cond_cfg_scales: [1]
+  time_schedule: logit_normal
