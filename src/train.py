@@ -34,7 +34,7 @@ from modules.t5_encoder import get_encoder
 from utils.logging_utils import log_for_0
 from utils.checkpoint_utils import (
     save_checkpoint, load_encoder_checkpoint, load_checkpoint,
-    find_latest_checkpoint,
+    find_latest_checkpoint, merge_pretrained_into_lora_init,
 )
 from utils.train_utils import (
     TrainState, prefetch_to_device, get_optimizer, create_learning_rate_fn,
@@ -146,6 +146,10 @@ def run_training(config):
     except TypeError:
         vocab_size = tokenizer.vocab_size
     log_for_0(f"Tokenizer vocab: CE head={vocab_size}")
+    lora_rank = getattr(config, 'lora_rank', 0) or 0
+    lora_alpha = getattr(config, 'lora_alpha', None)
+    if lora_alpha is None:
+        lora_alpha = float(lora_rank) if lora_rank > 0 else 1.0
     model = model_fn(
         text_encoder_dim=encoder_config.d_model, max_length=max_length,
         attn_drop=config.attn_dropout, proj_drop=config.proj_dropout,
@@ -154,6 +158,7 @@ def run_training(config):
         vocab_size=vocab_size,
         num_model_mode_tokens=config.num_model_mode_tokens,
         bottleneck_dim=config.bottleneck_dim,
+        lora_rank=lora_rank, lora_alpha=lora_alpha,
     )
 
     log_for_0("Initializing ELF model...")
@@ -165,6 +170,40 @@ def run_training(config):
     log_for_0("\n" + model.tabulate(init_rng, **init_args))
     total_params = sum(x.size for x in jax.tree_util.tree_leaves(elf_params))
     log_for_0(f"ELF parameters: {total_params:,}")
+
+    if getattr(config, 'init_from_backbone_checkpoint', False):
+        from train_stage2 import load_frozen_backbone
+        if lora_rank > 0:
+            log_for_0(f"LoRA ablation: loading FROZEN pretrained backbone from "
+                      f"{config.backbone_checkpoint}, training only LoRA adapters "
+                      f"(rank={lora_rank}, alpha={lora_alpha}) for max_steps={config.max_steps}")
+            # The saved checkpoint predates LoRA -- it has no lora_A/lora_B leaves,
+            # so load_frozen_backbone's structural restore needs an exact-match,
+            # LoRA-free template. Build a throwaway clone of the same architecture
+            # (lora_rank=0) purely for this load, then merge its weights into the
+            # LoRA-enabled model's init params (which already has fresh LoRA
+            # leaves at proper init -- A small-random, B zero -- from the
+            # model.init() call above).
+            clean_model = model_fn(
+                text_encoder_dim=encoder_config.d_model, max_length=max_length,
+                attn_drop=config.attn_dropout, proj_drop=config.proj_dropout,
+                num_time_tokens=config.num_time_tokens,
+                num_self_cond_cfg_tokens=config.num_self_cond_cfg_tokens,
+                vocab_size=vocab_size,
+                num_model_mode_tokens=config.num_model_mode_tokens,
+                bottleneck_dim=config.bottleneck_dim,
+                lora_rank=0,
+            )
+            pretrained_params = load_frozen_backbone(config, clean_model, init_rng, encoder_config.d_model)
+            elf_params = {"params": merge_pretrained_into_lora_init(elf_params["params"], pretrained_params)}
+        else:
+            log_for_0(f"Fine-tune ablation: loading pretrained weights from "
+                      f"{config.backbone_checkpoint} (fresh optimizer/step=0, "
+                      f"linear-OT objective for max_steps={config.max_steps})")
+            pretrained_params = load_frozen_backbone(config, model, init_rng, encoder_config.d_model)
+            elf_params = {"params": pretrained_params}
+        total_params = sum(x.size for x in jax.tree_util.tree_leaves(elf_params))
+        log_for_0(f"Loaded pretrained ELF parameters: {total_params:,}")
 
     num_devices = jax.device_count()
     num_local_devices = jax.local_device_count()

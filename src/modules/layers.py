@@ -16,6 +16,22 @@ DEFAULT_KERNEL_INIT = nn.initializers.xavier_uniform()
 DEFAULT_BIAS_INIT = nn.initializers.constant(0.0)
 ZERO_INIT = nn.initializers.constant(0.0)
 NORMAL_INIT_002 = nn.initializers.normal(stddev=0.02)
+# Standard LoRA init: A ~ small random (breaks symmetry across the rank dim),
+# B = 0 so the LoRA branch contributes exactly 0 at init -- the frozen backbone's
+# forward pass is byte-identical to the unmodified pretrained model until the
+# first gradient step moves B away from zero.
+LORA_A_INIT = nn.initializers.normal(stddev=0.02)
+LORA_B_INIT = nn.initializers.constant(0.0)
+
+
+def lora_delta(x, in_dim, out_dim, rank, alpha, name):
+    """y_lora = (x @ A) @ B * (alpha / rank), added to a frozen base nn.Dense's
+    output. A: (in_dim, rank) small-random init, B: (rank, out_dim) zero init.
+    Call with the SAME `name` as the base Dense layer it augments so param
+    paths read naturally (e.g. 'qkv' -> 'qkv_lora_A', 'qkv_lora_B')."""
+    lora_A = nn.Dense(rank, use_bias=False, kernel_init=LORA_A_INIT, name=f'{name}_lora_A')(x)
+    lora_B = nn.Dense(out_dim, use_bias=False, kernel_init=LORA_B_INIT, name=f'{name}_lora_B')(lora_A)
+    return lora_B * (alpha / rank)
 
 
 def rotate_half(x):
@@ -158,6 +174,8 @@ class Attention(nn.Module):
     qk_norm: bool = True
     attn_drop: float = 0.0
     proj_drop: float = 0.0
+    lora_rank: int = 0     # 0 = disabled (default, byte-identical to no-LoRA behavior)
+    lora_alpha: float = 1.0
 
     @nn.compact
     def __call__(self, x, rope_fn, attention_mask=None, deterministic=True):
@@ -169,6 +187,8 @@ class Attention(nn.Module):
             self.dim * 3, use_bias=self.qkv_bias,
             kernel_init=DEFAULT_KERNEL_INIT, bias_init=bias_init, name='qkv',
         )(x)
+        if self.lora_rank > 0:
+            qkv = qkv + lora_delta(x, C, self.dim * 3, self.lora_rank, self.lora_alpha, name='qkv')
         qkv = qkv.reshape(B, N, 3, self.num_heads, head_dim).transpose(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         if self.qk_norm:
@@ -179,7 +199,10 @@ class Attention(nn.Module):
             k = rope_fn(k)
         x = scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
         x = x.transpose(0, 2, 1, 3).reshape(B, N, C)
+        attn_out_in = x
         x = nn.Dense(self.dim, kernel_init=DEFAULT_KERNEL_INIT, bias_init=DEFAULT_BIAS_INIT, name='proj')(x)
+        if self.lora_rank > 0:
+            x = x + lora_delta(attn_out_in, C, self.dim, self.lora_rank, self.lora_alpha, name='proj')
         return nn.Dropout(rate=self.proj_drop, deterministic=deterministic)(x)
 
 
@@ -189,16 +212,26 @@ class SwiGLUFFN(nn.Module):
     hidden_dim: int
     drop: float = 0.0
     bias: bool = True
+    lora_rank: int = 0     # 0 = disabled (default, byte-identical to no-LoRA behavior)
+    lora_alpha: float = 1.0
 
     @nn.compact
     def __call__(self, x, deterministic=True):
+        in_dim = x.shape[-1]
         hidden_dim = int(self.hidden_dim * 2 / 3)
         bias_init = DEFAULT_BIAS_INIT if self.bias else None
         dense = partial(nn.Dense, use_bias=self.bias, kernel_init=DEFAULT_KERNEL_INIT, bias_init=bias_init)
         x12 = dense(2 * hidden_dim, name='w12')(x)
+        if self.lora_rank > 0:
+            x12 = x12 + lora_delta(x, in_dim, 2 * hidden_dim, self.lora_rank, self.lora_alpha, name='w12')
         x1, x2 = jnp.split(x12, 2, axis=-1)
-        hidden = nn.Dropout(rate=self.drop, deterministic=deterministic)(nn.silu(x1) * x2)
-        return dense(self.dim, name='w3')(hidden)
+        gated = nn.silu(x1) * x2
+        hidden = nn.Dropout(rate=self.drop, deterministic=deterministic)(gated)
+        out = dense(self.dim, name='w3')(hidden)
+        if self.lora_rank > 0:
+            # Use `hidden` (post-dropout), matching exactly what the base w3 Dense sees.
+            out = out + lora_delta(hidden, hidden_dim, self.dim, self.lora_rank, self.lora_alpha, name='w3')
+        return out
 
 
 class FinalLayer(nn.Module):

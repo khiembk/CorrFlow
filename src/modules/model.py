@@ -16,6 +16,8 @@ class ELFBlock(nn.Module):
     mlp_ratio: float = 4.0
     attn_drop: float = 0.0
     proj_drop: float = 0.0
+    lora_rank: int = 0     # 0 = disabled (default, byte-identical to no-LoRA behavior)
+    lora_alpha: float = 1.0
 
     @nn.compact
     def __call__(self, x, rope_fn=None, attention_mask=None, deterministic=True):
@@ -24,12 +26,16 @@ class ELFBlock(nn.Module):
         x_normed = RMSNorm(self.hidden_size, eps=1e-6, name='norm1')(x)
         attn_out = Attention(
             self.hidden_size, self.num_heads, qkv_bias=True, qk_norm=True,
-            attn_drop=self.attn_drop, proj_drop=self.proj_drop, name='attn',
+            attn_drop=self.attn_drop, proj_drop=self.proj_drop,
+            lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name='attn',
         )(x_normed, rope_fn, attention_mask=attention_mask, deterministic=deterministic)
         x = x + attn_out
 
         x_normed = RMSNorm(self.hidden_size, eps=1e-6, name='norm2')(x)
-        mlp_out = SwiGLUFFN(self.hidden_size, mlp_hidden_dim, drop=self.proj_drop, name='mlp')(
+        mlp_out = SwiGLUFFN(
+            self.hidden_size, mlp_hidden_dim, drop=self.proj_drop,
+            lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name='mlp',
+        )(
             x_normed, deterministic=deterministic,
         )
         x = x + mlp_out
@@ -51,6 +57,9 @@ class ELF(nn.Module):
     num_self_cond_cfg_tokens: int = 4  # Number of in-context self-cond CFG tokens
     num_model_mode_tokens: int = 0  # If > 0, prepend learnable model-mode tokens that signal decoding mode
     vocab_size: int = 0  # Vocabulary size for decoder unembedding
+    lora_rank: int = 0     # 0 = disabled (default, byte-identical to no-LoRA behavior).
+                            # Applied to every block's attn qkv/proj and mlp w12/w3.
+    lora_alpha: float = 1.0
 
     def build_context(self, t, self_cond_cfg_scale=None):
         prefix_tokens = []
@@ -132,6 +141,7 @@ class ELF(nn.Module):
                 self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio,
                 attn_drop=self.attn_drop if in_drop_range else 0.0,
                 proj_drop=self.proj_drop if in_drop_range else 0.0,
+                lora_rank=self.lora_rank, lora_alpha=self.lora_alpha,
                 name=f'blocks_{i}',
             )
             x = block(x, rope_fn=feat_rope, attention_mask=attention_mask, deterministic=deterministic)

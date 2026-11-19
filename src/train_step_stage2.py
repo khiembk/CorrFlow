@@ -28,6 +28,7 @@ from utils.encoder_utils import encode_text
 from utils.sampling_utils import (
     sample_timesteps, sample_gp_path, sample_gp_path_correlation,
     sample_pde_gp_path, sample_clayton_gp_path, sample_cnp_path, net_out_to_v_x,
+    sample_random_order, gather_seq,
 )
 
 
@@ -70,7 +71,7 @@ def train_step_stage2(
     current_step_rng = jax.random.fold_in(
         current_step_rng, jax.lax.axis_index(axis_name="batch")
     )
-    t_rng, noise_rng = jax.random.split(current_step_rng, 2)
+    t_rng, noise_rng, order_rng = jax.random.split(current_step_rng, 3)
 
     # ------------------------------------------------------------------ encode
     x0 = encode_text(
@@ -100,6 +101,10 @@ def train_step_stage2(
     )  # (B,)
 
     noise = jax.random.normal(noise_rng, x0.shape, dtype=x0.dtype)  # (B, L, d)
+
+    # Set by the corr_context_order == 'random' branch below; stays None
+    # (i.e. CorrNetwork sees natural order) for every other path.
+    order_perm, order_inv_perm = None, None
 
     if getattr(config, 'use_cnp_gp', False):
         z_gp, v_gp, _, _ = sample_cnp_path(
@@ -142,6 +147,30 @@ def train_step_stage2(
             cond_seq_mask=cond_seq_mask,
             split_at=getattr(config, 'max_input_length', None),
         )
+    elif getattr(config, 'corr_context_order', 'causal') == 'random':
+        # Ablation: GP-path target construction sees a per-row random
+        # permutation of the sequence instead of natural order, so each
+        # token's GP context becomes a random q-subset of the OTHER tokens
+        # rather than the q spatially preceding ones. Permute x0/noise/
+        # cond_seq_mask going in, un-permute z_gp/v_gp coming out so
+        # everything downstream (backbone input, loss against v_con) stays
+        # indexed by original position. See make_corr_model_apply_fn for the
+        # matching inference-time behavior and sample_random_order's docstring.
+        order_perm, order_inv_perm = sample_random_order(order_rng, batch_size, x0.shape[1])
+        x0_perm = gather_seq(x0, order_perm)
+        noise_perm = gather_seq(noise, order_perm)
+        cond_seq_mask_perm = gather_seq(cond_seq_mask, order_perm) if cond_seq_mask is not None else None
+        z_gp_perm, v_gp_perm, _ = sample_gp_path(
+            x0_perm, noise_perm, t,
+            gp_q=config.gp_q,
+            gp_rho=config.gp_rho,
+            gp_kernel=config.gp_kernel,
+            noise_scale=config.denoiser_noise_scale,
+            cond_seq_mask=cond_seq_mask_perm,
+            split_at=getattr(config, 'max_input_length', None),
+        )
+        z_gp = gather_seq(z_gp_perm, order_inv_perm)
+        v_gp = gather_seq(v_gp_perm, order_inv_perm)
     else:
         z_gp, v_gp, _ = sample_gp_path(
             x0, noise, t,
@@ -187,17 +216,31 @@ def train_step_stage2(
         v_ind = jax.lax.stop_gradient(v_ind_raw)
 
         # --- correlation network predicts per-token velocity correction ---
+        # Random-order ablation: present v_ind (and z_gp, for EmCorrNet) to the
+        # CorrNetwork's causal conv in permuted order (same permutation used to
+        # build the GP target above), then invert so delta_v lines back up with
+        # v_ind's natural-order indexing for the v_con/v_gp comparison below.
+        if order_perm is not None:
+            v_ind_for_corr = gather_seq(v_ind, order_perm)
+            z_gp_for_corr = gather_seq(z_gp, order_perm)
+        else:
+            v_ind_for_corr = v_ind
+            z_gp_for_corr = z_gp
+
         # EmCorrNet receives the GP latent z_gp as an extra input (stop-gradient).
         if config.corr_model.startswith('EmCorrNet'):
             delta_v = corr_state.apply_fn(
                 {"params": corr_params},
-                v_ind, jax.lax.stop_gradient(z_gp), t,
+                v_ind_for_corr, jax.lax.stop_gradient(z_gp_for_corr), t,
             )  # (B, L, d)
         else:
             delta_v = corr_state.apply_fn(
                 {"params": corr_params},
-                v_ind, t,
+                v_ind_for_corr, t,
             )  # (B, L, d)
+
+        if order_inv_perm is not None:
+            delta_v = gather_seq(delta_v, order_inv_perm)
 
         # --- composed velocity and GP-target loss ---
         v_con = v_ind + delta_v

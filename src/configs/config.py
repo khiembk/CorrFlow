@@ -67,6 +67,17 @@ class Config:
     # generation diversity relative to the frozen Stage 1 backbone.
     corr_strength: float = 1.0
 
+    # Context-order ablation: "causal" (default) keeps C_i = the gp_q tokens
+    # immediately preceding i in natural sequence order, matching training's
+    # original design and every published result. "random" replaces this with
+    # a per-sample random permutation of the sequence (same permutation for
+    # the GP-path target and the CorrNetwork's causal conv, fixed for a whole
+    # generation trajectory at inference) -- see sample_random_order and
+    # make_corr_model_apply_fn in utils/sampling_utils.py. Only the noise-GP
+    # path (plain sample_gp_path, i.e. use_path_gp/use_clayton_gp/use_pde_gp/
+    # use_cnp_gp all False) implements this; other GP variants are unaffected.
+    corr_context_order: str = 'causal'
+
     # GP path (Stage 2: correlation-aware path)
     gp_q: int = 2             # Context window size: token i conditions on the previous gp_q tokens
     gp_rho: float = 0.5       # Adjacent-token correlation (noise-GP kernel denominator).
@@ -115,6 +126,29 @@ class Config:
     # CorrNetwork φ_η (Stage 2: correlation network)
     corr_model: str = 'CorrNet-M'  # Size variant: CorrNet-S (h=128), CorrNet-M (h=256), CorrNet-L (h=512)
     backbone_checkpoint: str = None  # Path to frozen Stage 1 checkpoint (Stage 2 only)
+
+    # Stage 1 (train.py) ablation: fine-tune a PRETRAINED backbone with the
+    # plain linear-OT objective instead of training from random init.
+    # backbone_checkpoint doubles as the weights source here (same field
+    # Stage 2 uses); when this is True, train.py loads ONLY params/ema_params
+    # from it via train_stage2.load_frozen_backbone (handles both this
+    # repo's msgpack format and HF's orbax ocdbt format) and starts the
+    # optimizer/step counter fresh at 0 -- NOT a --resume (which would also
+    # carry over opt_state/step/epoch from the checkpoint and make max_steps
+    # a no-op if the checkpoint's own step already exceeds it).
+    init_from_backbone_checkpoint: bool = False
+
+    # Stage 1 (train.py) ablation: freeze the pretrained backbone entirely and
+    # ONLY train LoRA low-rank adapters (A: (in,rank) small-random, B: (rank,out)
+    # zero-init) injected into every block's attn qkv/proj and mlp w12/w3 --
+    # see modules/layers.py:lora_delta. Requires init_from_backbone_checkpoint
+    # also set (LoRA fine-tunes a pretrained checkpoint, not random init).
+    # 0 = disabled (default). When > 0, train.py builds a gradient mask so only
+    # params with 'lora_A'/'lora_B' in their path receive nonzero optimizer
+    # updates -- the base backbone weights are mathematically frozen even
+    # though JAX still computes (and discards) a gradient for them.
+    lora_rank: int = 0
+    lora_alpha: float = None  # defaults to lora_rank (scaling factor = 1.0) if unset
 
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step

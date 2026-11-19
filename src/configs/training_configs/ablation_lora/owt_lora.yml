@@ -1,0 +1,111 @@
+# Ablation: FREEZE the pretrained ELF-B-owt backbone entirely and train ONLY
+# LoRA low-rank adapters on top (train.py, NOT train_stage2.py; no GP path,
+# no CorrNetwork -- the LoRA adapters are injected directly into the
+# backbone's own attn qkv/proj and mlp w12/w3, see modules/layers.py:
+# lora_delta). Same linear-OT objective and 4-stage 2k/4k/6k/8k schedule as
+# ablation_finetune_linear/owt_finetune_linear.yml, so the two are directly
+# comparable: "full fine-tune" vs "LoRA-only fine-tune" of the identical
+# pretrained checkpoint on the identical objective/data/step budget.
+#
+# lora_rank=16 -> 2,359,296 trainable LoRA params (~2.36M), verified by
+# direct parameter count (see commit message / session notes) -- same order
+# of magnitude as the CorrNet-L/XL correlation networks used in this
+# project's other Stage 2 ablations (~2-2.5M), chosen since a literal "~2.5k"
+# trainable-param budget is architecturally infeasible here: ELF-B has
+# hidden_size=768, so even a single rank-1 LoRA adapter on ONE projection in
+# ONE layer already costs 768+768=1536 params, before even considering the
+# other 3 projections (qkv, w12, w3) or the other 11 layers.
+# lora_alpha = lora_rank by default (scaling factor alpha/rank = 1.0).
+#
+# init_from_backbone_checkpoint: true + lora_rank > 0 makes train.py:
+#   1. Build a LoRA-free clone of the architecture purely to load the
+#      pretrained checkpoint (which predates LoRA and has no lora_A/lora_B
+#      leaves) via the same train_stage2.load_frozen_backbone loader Stage 2
+#      uses.
+#   2. Merge those pretrained weights into the LoRA-enabled model's fresh
+#      init params (utils/checkpoint_utils.merge_pretrained_into_lora_init)
+#      -- every non-LoRA leaf gets the pretrained value; lora_A (small
+#      random) / lora_B (zero) stay at their fresh init, so the model is
+#      mathematically identical to the unmodified pretrained checkpoint
+#      before the first gradient step.
+#   3. Mask gradients (train_step.py:mask_non_lora_grads) so only
+#      lora_A/lora_B ever receive a nonzero optimizer update -- the backbone
+#      itself never moves.
+
+data_path: "embedded-language-flows/openwebtext-t5"
+max_length: 1024
+pad_token: eos
+
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+model: ELF-B
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+backbone_checkpoint: /home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/ELF-B-owt
+init_from_backbone_checkpoint: true
+
+lora_rank: 16
+lora_alpha: 16.0
+
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+decoder_prob: 0.2
+decoder_noise_scale: 5.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+self_cond_prob: 0.5
+
+epochs: 50
+max_steps: 8000
+# Only ~2.36M params receive gradients (vs the full 104M in the
+# finetune_linear ablation), but JAX still computes a gradient for every
+# param before masking, so the forward+backward memory footprint is the
+# same as full fine-tuning. Reuse the same smoke-tested-working batch config.
+global_batch_size: 8
+grad_accum_steps: 4
+generation_batch_size: 64
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 500
+warmup_epochs: -1
+optimizer: muon
+
+ema_decay1: 0.9999
+
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+num_samples: 1000
+
+online_eval: true
+eval_ppl_model: "gpt2-large"
+eval_ppl_batch_size: 32
+eval_ppl_max_length: 1024
+
+eval_mauve: true
+eval_mauve_featurize_model: "gpt2-large"
+eval_mauve_max_length: 768
+
+log_freq: 100
+save_freq: 1
+eval_freq: 1
+
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/corrflow_baselines/outputs/ablation_lora/owt_lora"
+hf_repo_id: null
+resume: null
+
+use_wandb: false
+wandb_project: corrflow
+wandb_entity: null
+wandb_run_name: ablation_owt_lora
+
+seed: 42

@@ -117,6 +117,8 @@ def test_generation_uncond(
             t_eps=config.t_eps,
             use_z_input=use_z_input,
             corr_strength=config.corr_strength,
+            corr_context_order=getattr(config, 'corr_context_order', 'causal'),
+            order_seed=config.seed,
         )
 
     pad_token_id = get_pad_token_id(tokenizer)
@@ -372,6 +374,8 @@ def test_generation_cond(
             t_eps=config.t_eps,
             use_z_input=use_z_input,
             corr_strength=config.corr_strength,
+            corr_context_order=getattr(config, 'corr_context_order', 'causal'),
+            order_seed=config.seed,
         )
 
     encode_latent_mean, encode_latent_std = config.latent_mean, config.latent_std

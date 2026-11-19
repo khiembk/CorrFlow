@@ -9,6 +9,37 @@ from jax.scipy.special import ndtr, ndtri
 
 
 # ============================================
+# Random-order context ablation
+# ============================================
+# Ablation: instead of C_i = {i-q, ..., i-1} (the q tokens immediately
+# PRECEDING i in natural sequence order), both the GP-path target
+# construction and the CorrNetwork's causal window are applied to a
+# per-sample RANDOM PERMUTATION of the sequence, so C_i becomes a random
+# q-subset of the OTHER tokens rather than a fixed, spatially-local window.
+# The frozen Stage 1 backbone always sees tokens in their natural order
+# (only sample_gp_path's target and the CorrNetwork's own forward pass are
+# permuted); the permutation is inverted before combining v_ind + delta_v
+# with v_gp, so nothing downstream needs to know permutation happened.
+
+def sample_random_order(rng_key, batch_size, seq_len):
+    """One independent random permutation (and its inverse) per batch row.
+    Returns (perm, inv_perm), each (B, L) int32, with perm[b] a permutation
+    of range(L) and inv_perm[b][perm[b][k]] == k."""
+    keys = jax.random.split(rng_key, batch_size)
+    perm = jax.vmap(lambda k: jax.random.permutation(k, seq_len))(keys)
+    inv_perm = jnp.argsort(perm, axis=-1)
+    return perm, inv_perm
+
+
+def gather_seq(x, idx):
+    """Reorder x along its sequence axis (axis=1) per batch row according to
+    idx (B, L). Works for both (B, L) and (B, L, d) inputs."""
+    if x.ndim == 3:
+        return jnp.take_along_axis(x, idx[:, :, None], axis=1)
+    return jnp.take_along_axis(x, idx, axis=1)
+
+
+# ============================================
 # Noise Schedulers (how to compute z from x0 and noise)
 # ============================================
 
@@ -699,7 +730,8 @@ def sample_cnp_path(cnp_apply_fn, cnp_params, x0, noise, t, noise_scale=1.0,
 # ============================================
 
 def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_model, t_eps,
-                              use_z_input=False, corr_strength=1.0):
+                              use_z_input=False, corr_strength=1.0,
+                              corr_context_order="causal", order_seed=0):
     """Return a drop-in backbone apply_fn that adds the CorrNetwork velocity correction.
 
     During ODE/SDE sampling the caller does:
@@ -726,6 +758,16 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
             training exactly. 0.0 recovers pure v_ind (Stage 1 backbone only); used to
             isolate whether the correction network itself — independent of sampling
             schedule — is responsible for reduced generation diversity.
+        corr_context_order: "causal" (default) — CorrNetwork's causal conv sees the
+            natural, spatially-local preceding window, matching training. "random" —
+            ablation: v_ind is permuted by a per-batch-row random permutation (fixed
+            for the whole denoising trajectory, derived purely from order_seed + shape
+            so every call within one generation run reproduces the same permutation)
+            before the causal conv, and the output is un-permuted before combining
+            with v_ind — so phi_eta's context for token i becomes a random q-subset
+            of the OTHER tokens rather than the q spatially preceding ones. Only the
+            CorrNetwork's view changes; the backbone always sees natural order.
+        order_seed: seeds the random permutation when corr_context_order == "random".
     """
     def wrapped_apply_fn(params, z_input, t, **kwargs):
         net_out = backbone_apply_fn(params, z_input, t, **kwargs)
@@ -740,10 +782,26 @@ def make_corr_model_apply_fn(backbone_apply_fn, corr_apply_fn, corr_params, d_mo
         # Compute v_ind, apply phi_eta, back-project to x_pred space
         t_denom = jnp.maximum(1.0 - t[:, None, None], t_eps)
         v_ind = (x_pred - z) / t_denom
-        if use_z_input:
-            delta_v = corr_apply_fn({"params": corr_params}, v_ind, z, t)
+
+        if corr_context_order == "random":
+            B, L, _ = v_ind.shape
+            perm, inv_perm = sample_random_order(jax.random.PRNGKey(order_seed), B, L)
+            v_ind_for_corr = gather_seq(v_ind, perm)
+            z_for_corr = gather_seq(z, perm) if use_z_input else None
+            t_for_corr = t
         else:
-            delta_v = corr_apply_fn({"params": corr_params}, v_ind, t)
+            v_ind_for_corr = v_ind
+            z_for_corr = z if use_z_input else None
+            t_for_corr = t
+
+        if use_z_input:
+            delta_v = corr_apply_fn({"params": corr_params}, v_ind_for_corr, z_for_corr, t_for_corr)
+        else:
+            delta_v = corr_apply_fn({"params": corr_params}, v_ind_for_corr, t_for_corr)
+
+        if corr_context_order == "random":
+            delta_v = gather_seq(delta_v, inv_perm)
+
         v_con = v_ind + corr_strength * delta_v
         x_pred_modified = v_con * t_denom + z
 

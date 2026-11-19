@@ -307,3 +307,30 @@ def load_checkpoint(checkpoint_path: str, state_template: Any) -> Tuple[Any, int
     step, epoch = int(ckpt["step"]), int(ckpt["epoch"])
     log_for_0(f"Loaded {loaded_from} checkpoint from step {step} (epoch {epoch})")
     return restored_state, step
+
+
+def merge_pretrained_into_lora_init(init_params, pretrained_params):
+    """Recursively overlay pretrained (LoRA-free) weights onto a freshly
+    model.init()'d params pytree that has EXTRA leaves (lora_A/lora_B, or any
+    other new sibling param) not present in the pretrained checkpoint.
+
+    For every key present in BOTH trees, use the pretrained value. For keys
+    present ONLY in init_params (e.g. the newly-added LoRA adapters), keep the
+    fresh init value untouched. Raises if a key exists in pretrained_params
+    but not in init_params (would indicate init_params was built with an
+    incompatible/smaller architecture than the checkpoint).
+    """
+    if isinstance(init_params, dict):
+        pretrained_keys = set(pretrained_params.keys())
+        unknown = pretrained_keys - set(init_params.keys())
+        if unknown:
+            raise ValueError(
+                f"merge_pretrained_into_lora_init: pretrained checkpoint has keys "
+                f"{unknown} not present in the freshly-initialized model -- "
+                f"architecture mismatch (not just extra LoRA leaves)."
+            )
+        return {
+            k: (merge_pretrained_into_lora_init(v, pretrained_params[k]) if k in pretrained_params else v)
+            for k, v in init_params.items()
+        }
+    return jnp.array(pretrained_params)

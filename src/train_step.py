@@ -16,6 +16,19 @@ from utils.sampling_utils import (
 Array = jnp.ndarray
 
 
+def mask_non_lora_grads(grads):
+    """Zero every gradient leaf whose param path doesn't name a LoRA adapter
+    (lora_A / lora_B, see modules/layers.py:lora_delta). Used by the LoRA
+    ablation (config.lora_rank > 0) to keep the pretrained backbone frozen."""
+    def mask_leaf(path, g):
+        path_str = "/".join(
+            getattr(p, "key", getattr(p, "name", str(p))) for p in path
+        )
+        is_lora = "lora_A" in path_str or "lora_B" in path_str
+        return g if is_lora else jnp.zeros_like(g)
+    return jax.tree_util.tree_map_with_path(mask_leaf, grads)
+
+
 def train_step(
     state: TrainState,
     encoder_params: Dict,
@@ -224,6 +237,13 @@ def train_step(
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, (l2_loss_val, ce_loss_val)), grads = grad_fn(state.params)
+
+    if getattr(config, 'lora_rank', 0) > 0:
+        # LoRA ablation: zero out every gradient except the LoRA adapters, so
+        # the pretrained backbone is mathematically frozen (zero grad -> Muon's
+        # momentum-based update is also zero) even though JAX still computed a
+        # (discarded) gradient for every param during the backward pass.
+        grads = mask_non_lora_grads(grads)
 
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
