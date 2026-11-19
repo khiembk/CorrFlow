@@ -34,6 +34,9 @@ class Config:
     max_length: int = 128
     max_input_length: int = None  # Max length for conditioning input (e.g., prompt or encoder input); None = no limit
     pad_token: str = "pad"  # "pad" or "eos" - which token to use for padding
+    code_target: bool = False  # Targets are Python escaped by utils.code_utils (TinyGSM); score samples by execution
+    exec_num_proc: int = 16  # Programs executed in parallel when code_target is set
+    exec_timeout: float = 10.0  # Wall-clock seconds allowed per generated program
 
     # Tokenizer
     tokenizer_name: str = None  # Defaults to encoder_model_name if not set

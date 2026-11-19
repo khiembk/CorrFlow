@@ -27,6 +27,7 @@ from utils.generation_utils import (
     _build_run_name,
 )
 from utils.sampling_utils import make_corr_model_apply_fn
+from utils.code_utils import decode_sample, execution_accuracy
 
 
 # ============================================
@@ -502,7 +503,9 @@ def test_generation_cond(
             for i in range(min(batch_size_current, actual_batch_size)):
                 if samples_processed >= num_samples:
                     break
-                text = tokenizer.decode(np.array(predicted_ids[i]), skip_special_tokens=True)
+                ids_i = np.array(predicted_ids[i])
+                text = (decode_sample(tokenizer, ids_i) if config.code_target
+                        else tokenizer.decode(ids_i, skip_special_tokens=True))
                 all_generated.append((samples_processed, original_texts[i], text, context_texts[i]))
                 samples_processed += 1
 
@@ -529,13 +532,26 @@ def test_generation_cond(
             if config.online_eval and all_generated:
                 hypotheses = [gen for _, _, gen, _ in all_generated]
                 references = [orig for _, orig, _, _ in all_generated]
-                bleu_score = compute_bleu(hypotheses, references)
-                rouge_scores = compute_rouge(hypotheses, references)
-                cond_eval_results = {"bleu": bleu_score, **rouge_scores}
-                log_for_0(
-                    f"BLEU: {bleu_score:.2f}  ROUGE-1: {rouge_scores['rouge1']:.2f}  "
-                    f"ROUGE-2: {rouge_scores['rouge2']:.2f}  ROUGE-L: {rouge_scores['rougeL']:.2f}"
-                )
+                if config.code_target:
+                    # Text overlap with a bare numeric answer is meaningless; run each program instead.
+                    cond_eval_results = execution_accuracy(
+                        hypotheses, references,
+                        num_proc=config.exec_num_proc, timeout=config.exec_timeout,
+                    )
+                    log_for_0(
+                        f"Exec accuracy: {100 * cond_eval_results['exec_accuracy']:.2f}% "
+                        f"[95% CI {100 * cond_eval_results['exec_accuracy_ci_low']:.2f}, "
+                        f"{100 * cond_eval_results['exec_accuracy_ci_high']:.2f}]  "
+                        f"ran: {100 * cond_eval_results['exec_rate']:.1f}%  n={cond_eval_results['n']}"
+                    )
+                else:
+                    bleu_score = compute_bleu(hypotheses, references)
+                    rouge_scores = compute_rouge(hypotheses, references)
+                    cond_eval_results = {"bleu": bleu_score, **rouge_scores}
+                    log_for_0(
+                        f"BLEU: {bleu_score:.2f}  ROUGE-1: {rouge_scores['rouge1']:.2f}  "
+                        f"ROUGE-2: {rouge_scores['rouge2']:.2f}  ROUGE-L: {rouge_scores['rougeL']:.2f}"
+                    )
 
             if config.use_wandb:
                 table = wandb.Table(columns=["sample_id", "context", "original", "generated"])
@@ -544,10 +560,7 @@ def test_generation_cond(
                 wandb_tables[f"generated_samples_cond_steps{num_sampling_steps}_cfg{cfg_scale}"] = table
                 if cond_eval_results is not None:
                     wandb_tables.update({
-                        f"generation/{name}/bleu": cond_eval_results["bleu"],
-                        f"generation/{name}/rouge1": cond_eval_results["rouge1"],
-                        f"generation/{name}/rouge2": cond_eval_results["rouge2"],
-                        f"generation/{name}/rougeL": cond_eval_results["rougeL"],
+                        f"generation/{name}/{k}": v for k, v in cond_eval_results.items()
                     })
             if cond_eval_results is not None:
                 metrics_line = {"epoch": epoch_val, "step": step_val, **cond_eval_results}

@@ -1,0 +1,17 @@
+# Math reasoning (GSM8K): 1,024-step ODE and SDE (γ=0.2) schedules, both with
+# CFG=2.5 and SC-CFG=1. Ported from the original ELF repo's
+# train_tinygsm_ELF-B.yml-adjacent sampling config -- longer generation
+# (max_length=512, mostly code) needs far more sampling steps than OWT/WMT14/
+# XSum to resolve correctly.
+- sampling_method: ode
+  num_sampling_steps: [1024]
+  cfgs: [2.5]
+  self_cond_cfg_scales: [1]
+  time_schedule: logit_normal
+
+- sampling_method: sde
+  num_sampling_steps: [1024]
+  cfgs: [2.5]
+  sde_gamma: 0.2
+  self_cond_cfg_scales: [1]
+  time_schedule: logit_normal
