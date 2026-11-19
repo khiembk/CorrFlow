@@ -55,27 +55,46 @@ def compute_mauve(
     device_id: int = -1,
     max_text_length: int = 1024,
     verbose: bool = False,
+    seed: int = 25,
+    equalize_sample_counts: bool = True,
 ) -> Dict:
     """MAUVE score (Pillutla et al. 2021) between generated and reference text.
 
     Compares the generated-text distribution to a reference (real-text) sample via
-    GPT-2 embeddings + divergence-frontier estimation. Runs on CPU by default
-    (device_id=-1) since this JAX project's torch install has no CUDA backend.
+    GPT-2 embeddings + divergence-frontier estimation. device_id=-1 (CPU) is the
+    default for backward compatibility with existing callers; pass an explicit GPU
+    index (e.g. device_id=0) to featurize on GPU -- this project's torch install
+    does have CUDA support, the earlier claim otherwise in this docstring was stale.
+
+    Args:
+        equalize_sample_counts: if True (default, matches all existing call sites'
+            prior behavior), silently truncates both lists to min(len(p), len(q))
+            before scoring -- mauve-text does NOT require equal p/q sizes, this is
+            purely this wrapper's historical default. Set False to score the full,
+            independently-sized sets as given (p_text/q_text may differ in length).
     """
     import mauve as mauve_lib
 
-    n = min(len(generated_texts), len(reference_texts))
-    if n < 2:
-        return {"mauve": float("nan")}
+    p_text, q_text = reference_texts, generated_texts
+    if equalize_sample_counts:
+        n = min(len(generated_texts), len(reference_texts))
+        p_text, q_text = reference_texts[:n], generated_texts[:n]
+    if len(p_text) < 2 or len(q_text) < 2:
+        return {"mauve": float("nan"), "num_reference": len(p_text), "num_generated": len(q_text)}
     out = mauve_lib.compute_mauve(
-        p_text=reference_texts[:n],
-        q_text=generated_texts[:n],
+        p_text=p_text,
+        q_text=q_text,
         featurize_model_name=featurize_model_name,
         device_id=device_id,
         max_text_length=max_text_length,
         verbose=verbose,
+        seed=seed,
     )
-    return {"mauve": float(out.mauve)}
+    return {
+        "mauve": float(out.mauve),
+        "num_reference": len(p_text),
+        "num_generated": len(q_text),
+    }
 
 
 def compute_rouge(hypotheses, references, return_std=False):

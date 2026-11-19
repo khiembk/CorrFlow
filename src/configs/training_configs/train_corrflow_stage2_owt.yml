@@ -77,6 +77,13 @@ eval_ppl_model: "gpt2-large"
 eval_ppl_batch_size: 32
 eval_ppl_max_length: 1024
 
+# MAUVE (opt-in via eval_mauve: true). 768 is OWT's corrected truncation
+# window -- symmetric truncation of these ~1024-token documents to 768 GPT-2
+# tokens avoids the last-token-mismatch collapse seen at the old default of
+# 1024 (see docs/lm1b_mauve_debug.md and the OWT MAUVE investigation).
+eval_mauve: false
+eval_mauve_max_length: 768
+
 # Logging & Checkpointing
 log_freq: 100
 save_freq: 1

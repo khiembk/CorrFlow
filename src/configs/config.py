@@ -170,6 +170,17 @@ class Config:
     eval_mauve: bool = False  # Also compute MAUVE (vs. a real-text reference sample) and REP-4
     eval_mauve_featurize_model: str = "gpt2-large"  # Featurizer for MAUVE's GPT-2 embeddings
     eval_mauve_device_id: int = 0  # torch device index for MAUVE featurization (-1 = CPU)
+    # GPT-2 token truncation window for MAUVE featurization. Dataset-specific:
+    # OWT's corrected protocol uses 768 (symmetric truncation of ~1024-token
+    # documents avoids the last-token-mismatch collapse seen at the old
+    # default of 1024 -- see docs/lm1b_mauve_debug.md and the OWT MAUVE fix).
+    # LM1B's own sentence-level examples average ~28 GPT-2 tokens -- far
+    # below any truncation window -- so 96 (matching the external LM1B
+    # MAUVE convention) is a reasonable default there, though per
+    # docs/lm1b_mauve_debug.md this window is NOT the dominant factor in
+    # LM1B's low score. Default (1024) preserves prior behavior for any
+    # config that doesn't set this explicitly.
+    eval_mauve_max_length: int = 1024
 
     # First-sentence truncation for unconditional generation (opt-in, off by default).
     # LM1B's preprocessing never appends an EOS token (add_special_tokens=False), so

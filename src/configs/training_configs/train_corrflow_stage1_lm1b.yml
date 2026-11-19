@@ -54,6 +54,16 @@ eval_ppl_model: "gpt2-large"
 eval_ppl_batch_size: 32
 eval_ppl_max_length: 256
 
+# MAUVE (opt-in via eval_mauve: true). 96 GPT-2 tokens matches the external
+# LM1B MAUVE convention (JPEG-DLM). NOTE: per docs/lm1b_mauve_debug.md this
+# truncation window is NOT the dominant factor in LM1B's low MAUVE score --
+# real LM1B sentences average ~28 GPT-2 tokens, generated text ~105, so
+# almost nothing on the reference side is ever truncated regardless of this
+# setting. Prefer --reference-mode sentence with held-out references via
+# src/eval_lm1b_mauve.py for a defensible comparison; see that doc for why.
+eval_mauve: false
+eval_mauve_max_length: 96
+
 log_freq: 100
 save_freq: 1
 eval_freq: 1

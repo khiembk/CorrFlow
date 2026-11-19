@@ -292,6 +292,7 @@ def test_generation_uncond(
                         reference_texts=reference_texts,
                         featurize_model_name=config.eval_mauve_featurize_model,
                         device_id=config.eval_mauve_device_id,
+                        max_text_length=config.eval_mauve_max_length,
                     ))
                 else:
                     mauve_rep_results["mauve"] = float("nan")
